@@ -156,13 +156,15 @@ with st.sidebar:
     )
 
 # ─── Data Fetching ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
-def fetch_stock_data(sym, max_retries: int = 3):
+# Note: @st.cache_data requires return values to be picklable. The yfinance
+# Ticker object (especially with a curl_cffi session attached) is NOT picklable,
+# so we only return the serializable data (dict + DataFrames), not the Ticker.
+@st.cache_data(ttl=600, show_spinner="Fetching data from Yahoo Finance...")
+def fetch_stock_data(sym, max_retries: int = 4):
     """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff."""
     last_err = None
     for attempt in range(max_retries):
         try:
-            # Use the curl_cffi session when available to avoid rate limits
             if _YF_SESSION is not None:
                 stk = yf.Ticker(sym, session=_YF_SESSION)
             else:
@@ -171,34 +173,37 @@ def fetch_stock_data(sym, max_retries: int = 3):
             info = stk.info or {}
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             if not info or price is None:
-                # Retry — Yahoo sometimes returns an empty info on transient throttling
                 last_err = "Empty response from Yahoo Finance (likely rate-limited)."
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(2.0 * (attempt + 1))
                 continue
 
-            return (
-                stk,
-                info,
-                stk.financials,
-                stk.cashflow,
-                stk.balance_sheet,
-                stk.history(period="1y"),
-                None,
-            )
+            return {
+                "info": dict(info),
+                "financials": stk.financials,
+                "cashflow": stk.cashflow,
+                "balance_sheet": stk.balance_sheet,
+                "price_hist": stk.history(period="1y"),
+                "error": None,
+            }
         except Exception as exc:
             last_err = str(exc)
-            # Exponential-ish backoff between retries
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2.0 * (attempt + 1))
 
-    return None, None, None, None, None, None, last_err or "Unknown error fetching data."
+    # Raise so the error is NOT cached — each call retries fresh
+    raise RuntimeError(last_err or "Unknown error fetching data.")
 
-result = fetch_stock_data(ticker_input)
-# unpack safely
-if len(result) == 7:
-    stock_obj, info, financials, cashflow, balance_sheet, price_hist, fetch_error = result
-else:
-    stock_obj, info, financials, cashflow, balance_sheet, price_hist = result
-    fetch_error = None
+try:
+    _data = fetch_stock_data(ticker_input)
+    info            = _data["info"]
+    financials      = _data["financials"]
+    cashflow        = _data["cashflow"]
+    balance_sheet   = _data["balance_sheet"]
+    price_hist      = _data["price_hist"]
+    stock_obj       = None  # no longer needed downstream
+    fetch_error     = None
+except Exception as _e:
+    info, financials, cashflow, balance_sheet, price_hist, stock_obj = (None,) * 6
+    fetch_error = str(_e)
 
 if fetch_error or info is None:
     st.error(
