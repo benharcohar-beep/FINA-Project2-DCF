@@ -13,8 +13,17 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import time
 import warnings
 warnings.filterwarnings("ignore")
+
+# curl_cffi impersonates a real browser's TLS fingerprint, which reliably
+# bypasses Yahoo Finance's rate-limiting of Streamlit Cloud's shared IPs.
+try:
+    from curl_cffi import requests as curl_requests
+    _YF_SESSION = curl_requests.Session(impersonate="chrome")
+except Exception:
+    _YF_SESSION = None
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -148,23 +157,40 @@ with st.sidebar:
 
 # ─── Data Fetching ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
-def fetch_stock_data(sym):
-    try:
-        stk = yf.Ticker(sym)
-        info = stk.info
-        if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
-            return None, None, None, None, None, "Ticker not found or no price data available."
-        return (
-            stk,
-            info,
-            stk.financials,
-            stk.cashflow,
-            stk.balance_sheet,
-            stk.history(period="1y"),
-            None,
-        )
-    except Exception as exc:
-        return None, None, None, None, None, None, str(exc)
+def fetch_stock_data(sym, max_retries: int = 3):
+    """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            # Use the curl_cffi session when available to avoid rate limits
+            if _YF_SESSION is not None:
+                stk = yf.Ticker(sym, session=_YF_SESSION)
+            else:
+                stk = yf.Ticker(sym)
+
+            info = stk.info or {}
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            if not info or price is None:
+                # Retry — Yahoo sometimes returns an empty info on transient throttling
+                last_err = "Empty response from Yahoo Finance (likely rate-limited)."
+                time.sleep(1.5 * (attempt + 1))
+                continue
+
+            return (
+                stk,
+                info,
+                stk.financials,
+                stk.cashflow,
+                stk.balance_sheet,
+                stk.history(period="1y"),
+                None,
+            )
+        except Exception as exc:
+            last_err = str(exc)
+            # Exponential-ish backoff between retries
+            time.sleep(1.5 * (attempt + 1))
+
+    return None, None, None, None, None, None, last_err or "Unknown error fetching data."
 
 result = fetch_stock_data(ticker_input)
 # unpack safely
@@ -175,8 +201,48 @@ else:
     fetch_error = None
 
 if fetch_error or info is None:
-    st.error(f"❌ Could not load data for **'{ticker_input}'**. {fetch_error or ''} Please check the ticker symbol.")
-    st.stop()
+    st.error(
+        f"❌ Could not load live data for **'{ticker_input}'**.\n\n"
+        f"**Reason:** {fetch_error or 'Unknown error.'}\n\n"
+        "This is usually a temporary Yahoo Finance rate-limit on Streamlit Cloud's shared IPs. "
+        "Try again in ~30 seconds, switch tickers (e.g. MSFT, GOOGL, JNJ), or run the app locally."
+    )
+
+    with st.expander("🛠 Manual-input mode — run the DCF without Yahoo Finance"):
+        st.markdown(
+            "Enter the inputs below to run the DCF model manually. "
+            "You can pull these from any 10-K / analyst report."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            m_price = st.number_input("Current Share Price ($)", min_value=0.0, value=150.0, step=1.0, key="m_price")
+            m_rev   = st.number_input("Latest Annual Revenue ($M)", min_value=0.0, value=100000.0, step=1000.0, key="m_rev")
+            m_shares = st.number_input("Shares Outstanding (millions)", min_value=0.0, value=1000.0, step=10.0, key="m_shares")
+        with c2:
+            m_debt  = st.number_input("Total Debt ($M)", min_value=0.0, value=5000.0, step=100.0, key="m_debt")
+            m_cash  = st.number_input("Cash & Equivalents ($M)", min_value=0.0, value=10000.0, step=100.0, key="m_cash")
+            m_da    = st.number_input("D&A ($M)", min_value=0.0, value=3000.0, step=100.0, key="m_da")
+
+        if st.button("▶ Run DCF with manual inputs", type="primary"):
+            # Stub an `info` dict so the rest of the script can proceed
+            info = {
+                "currentPrice": m_price,
+                "regularMarketPrice": m_price,
+                "totalRevenue": m_rev * 1e6,
+                "sharesOutstanding": m_shares * 1e6,
+                "totalDebt": m_debt * 1e6,
+                "totalCash": m_cash * 1e6,
+                "longName": ticker_input,
+                "sector": "Manual Input",
+                "industry": "Manual Input",
+                "beta": 1.0,
+            }
+            financials, cashflow, balance_sheet, price_hist, stock_obj = None, None, None, None, None
+            st.session_state["_manual_da"] = m_da * 1e6
+        else:
+            st.stop()
+    if info is None:
+        st.stop()
 
 # ─── Helper ───────────────────────────────────────────────────────────────────
 def sg(key, default=0):
@@ -220,7 +286,8 @@ try:
 except Exception:
     pass
 if da_value == 0:
-    da_value = base_revenue * 0.03  # fallback: 3% of revenue
+    # Use manual-input D&A if user supplied it, otherwise fallback to 3% of revenue
+    da_value = st.session_state.get("_manual_da") or (base_revenue * 0.03)
 
 # ─── Section 1: Company Snapshot ──────────────────────────────────────────────
 st.header(f"🏢 {company_name}  ({ticker_input})")
