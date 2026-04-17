@@ -329,6 +329,10 @@ if price_hist is not None and not price_hist.empty:
         xaxis_title="Date", yaxis_title="Price (USD)",
         height=280, showlegend=False,
         plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(color="#222", size=12),
+        title_font=dict(color="#1f4e79", size=15),
+        xaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
+        yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
         margin=dict(t=40, b=30, l=0, r=0),
     )
     st.plotly_chart(fig_price, use_container_width=True)
@@ -504,7 +508,11 @@ fig_fcf.update_layout(
     xaxis_title="Year", yaxis_title="$ Millions",
     barmode="group", height=320,
     plot_bgcolor="white", paper_bgcolor="white",
-    legend=dict(orientation="h", y=1.1),
+    font=dict(color="#222", size=12),
+    title_font=dict(color="#1f4e79", size=15),
+    xaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
+    yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
+    legend=dict(orientation="h", y=1.1, font=dict(color="#222")),
     margin=dict(t=50, b=30),
 )
 st.plotly_chart(fig_fcf, use_container_width=True)
@@ -590,8 +598,12 @@ fig_pie = go.Figure(data=[go.Pie(
 fig_pie.update_layout(
     title="Enterprise Value Composition",
     height=300, showlegend=False,
+    plot_bgcolor="white", paper_bgcolor="white",
+    font=dict(color="#222", size=12),
+    title_font=dict(color="#1f4e79", size=15),
     margin=dict(t=40, b=10),
 )
+fig_pie.update_traces(textfont=dict(color="white", size=13))
 st.plotly_chart(fig_pie, use_container_width=True)
 
 st.markdown("---")
@@ -644,9 +656,14 @@ if current_price and iv_per_share:
         title=f"{ticker_input} — Price vs. Intrinsic Value",
         yaxis_title="Price (USD)", height=380,
         plot_bgcolor="white", paper_bgcolor="white",
+        font=dict(color="#222", size=12),
+        title_font=dict(color="#1f4e79", size=15),
+        xaxis=dict(linecolor="#999", tickfont=dict(color="#222", size=13)),
+        yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
         showlegend=False,
         margin=dict(t=50, b=30),
     )
+    fig_bar.update_traces(textfont=dict(color="#222", size=13))
     st.plotly_chart(fig_bar, use_container_width=True)
 
 st.markdown("---")
