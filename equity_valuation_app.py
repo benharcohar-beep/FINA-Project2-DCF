@@ -14,16 +14,32 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import time
+import random
 import warnings
 warnings.filterwarnings("ignore")
 
-# curl_cffi impersonates a real browser's TLS fingerprint, which reliably
-# bypasses Yahoo Finance's rate-limiting of Streamlit Cloud's shared IPs.
+# curl_cffi impersonates a real browser's TLS fingerprint to bypass
+# Yahoo Finance rate-limiting on Streamlit Cloud's shared IPs.
+# Fall back to a requests.Session with browser-like headers if unavailable.
 try:
     from curl_cffi import requests as curl_requests
-    _YF_SESSION = curl_requests.Session(impersonate="chrome")
+    _YF_SESSION = curl_requests.Session(impersonate="chrome110")
+    _YF_SESSION_TYPE = "curl_cffi"
 except Exception:
-    _YF_SESSION = None
+    import requests as _requests
+    _s = _requests.Session()
+    _s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+    })
+    _YF_SESSION = _s
+    _YF_SESSION_TYPE = "requests"
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -159,22 +175,21 @@ with st.sidebar:
 # Note: @st.cache_data requires return values to be picklable. The yfinance
 # Ticker object (especially with a curl_cffi session attached) is NOT picklable,
 # so we only return the serializable data (dict + DataFrames), not the Ticker.
-@st.cache_data(ttl=600, show_spinner="Fetching data from Yahoo Finance...")
-def fetch_stock_data(sym, max_retries: int = 4):
+@st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
+def fetch_stock_data(sym, max_retries: int = 5):
     """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff."""
     last_err = None
     for attempt in range(max_retries):
         try:
-            if _YF_SESSION is not None:
-                stk = yf.Ticker(sym, session=_YF_SESSION)
-            else:
-                stk = yf.Ticker(sym)
+            stk = yf.Ticker(sym, session=_YF_SESSION)
 
             info = stk.info or {}
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             if not info or price is None:
                 last_err = "Empty response from Yahoo Finance (likely rate-limited)."
-                time.sleep(2.0 * (attempt + 1))
+                # Exponential backoff with jitter: 2s, 5s, 11s, 23s, 47s
+                delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
+                time.sleep(delay)
                 continue
 
             return {
@@ -187,7 +202,8 @@ def fetch_stock_data(sym, max_retries: int = 4):
             }
         except Exception as exc:
             last_err = str(exc)
-            time.sleep(2.0 * (attempt + 1))
+            delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
+            time.sleep(delay)
 
     # Raise so the error is NOT cached — each call retries fresh
     raise RuntimeError(last_err or "Unknown error fetching data.")
@@ -213,7 +229,13 @@ if fetch_error or info is None:
         "Try again in ~30 seconds, switch tickers (e.g. MSFT, GOOGL, JNJ), or run the app locally."
     )
 
-    with st.expander("🛠 Manual-input mode — run the DCF without Yahoo Finance"):
+    col_retry, _ = st.columns([1, 4])
+    with col_retry:
+        if st.button("🔄 Retry Live Data", type="primary"):
+            st.cache_data.clear()
+            st.rerun()
+
+    with st.expander("🛠 Manual-input mode — run the DCF without Yahoo Finance", expanded=True):
         st.markdown(
             "Enter the inputs below to run the DCF model manually. "
             "You can pull these from any 10-K / analyst report."
