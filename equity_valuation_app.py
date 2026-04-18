@@ -331,9 +331,17 @@ if price_hist is not None and not price_hist.empty:
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(color="#222", size=12),
         title_font=dict(color="#1f4e79", size=15),
-        xaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
-        yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
-        margin=dict(t=40, b=30, l=0, r=0),
+        xaxis=dict(
+            gridcolor="#e5e5e5", linecolor="#999",
+            tickfont=dict(color="#222"),
+            title_font=dict(color="#222", size=13),
+        ),
+        yaxis=dict(
+            gridcolor="#e5e5e5", linecolor="#999",
+            tickfont=dict(color="#222"),
+            title_font=dict(color="#222", size=13),
+        ),
+        margin=dict(t=40, b=50, l=60, r=20),
     )
     st.plotly_chart(fig_price, use_container_width=True)
 
@@ -510,10 +518,18 @@ fig_fcf.update_layout(
     plot_bgcolor="white", paper_bgcolor="white",
     font=dict(color="#222", size=12),
     title_font=dict(color="#1f4e79", size=15),
-    xaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
-    yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
+    xaxis=dict(
+        gridcolor="#e5e5e5", linecolor="#999",
+        tickfont=dict(color="#222"),
+        title_font=dict(color="#222", size=13),
+    ),
+    yaxis=dict(
+        gridcolor="#e5e5e5", linecolor="#999",
+        tickfont=dict(color="#222"),
+        title_font=dict(color="#222", size=13),
+    ),
     legend=dict(orientation="h", y=1.1, font=dict(color="#222")),
-    margin=dict(t=50, b=30),
+    margin=dict(t=50, b=50, l=70, r=20),
 )
 st.plotly_chart(fig_fcf, use_container_width=True)
 
@@ -658,10 +674,17 @@ if current_price and iv_per_share:
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(color="#222", size=12),
         title_font=dict(color="#1f4e79", size=15),
-        xaxis=dict(linecolor="#999", tickfont=dict(color="#222", size=13)),
-        yaxis=dict(gridcolor="#e5e5e5", linecolor="#999", tickfont=dict(color="#222")),
+        xaxis=dict(
+            linecolor="#999",
+            tickfont=dict(color="#222", size=13),
+        ),
+        yaxis=dict(
+            gridcolor="#e5e5e5", linecolor="#999",
+            tickfont=dict(color="#222"),
+            title_font=dict(color="#222", size=13),
+        ),
         showlegend=False,
-        margin=dict(t=50, b=30),
+        margin=dict(t=50, b=30, l=70, r=20),
     )
     fig_bar.update_traces(textfont=dict(color="#222", size=13))
     st.plotly_chart(fig_bar, use_container_width=True)
