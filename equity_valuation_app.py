@@ -175,25 +175,47 @@ with st.sidebar:
 # Note: @st.cache_data requires return values to be picklable. The yfinance
 # Ticker object (especially with a curl_cffi session attached) is NOT picklable,
 # so we only return the serializable data (dict + DataFrames), not the Ticker.
-def _stooq_price(sym: str):
-    """Fallback price fetch from Stooq (no API key, no rate-limit on shared IPs).
-    Returns (latest_close, 1y price history DataFrame) or (None, None) on failure.
+def _yahoo_chart_price(sym: str):
+    """Fallback price fetch via Yahoo's public chart endpoint
+    (query1.finance.yahoo.com/v8/finance/chart/{sym}). This is the endpoint
+    Yahoo's own website uses and has much looser rate-limiting than the
+    `info` endpoint yfinance scrapes. Returns (latest_close, history_df)
+    or (None, None) on failure.
     """
     try:
-        import requests as _r
-        url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
-        r = _r.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200 or not r.text or "Date" not in r.text:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1y&interval=1d"
+        # Use the same browser-impersonation session if available
+        if _YF_SESSION_TYPE == "curl_cffi":
+            r = _YF_SESSION.get(url, timeout=10)
+        else:
+            r = _YF_SESSION.get(url, timeout=10)
+        if r.status_code != 200:
             return None, None
-        from io import StringIO
-        df = pd.read_csv(StringIO(r.text))
-        if df.empty or "Close" not in df.columns:
+        data = r.json()
+        result = (data.get("chart") or {}).get("result") or []
+        if not result:
             return None, None
-        df["Date"] = pd.to_datetime(df["Date"])
-        df = df.set_index("Date").tail(252)
-        return float(df["Close"].iloc[-1]), df
+        result = result[0]
+        meta = result.get("meta") or {}
+        price = meta.get("regularMarketPrice")
+        if price is None:
+            return None, None
+        # Build history DataFrame
+        timestamps = result.get("timestamp") or []
+        quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+        closes = quotes.get("close") or []
+        if timestamps and closes:
+            df = pd.DataFrame(
+                {"Close": closes, "Open": quotes.get("open") or closes,
+                 "High": quotes.get("high") or closes, "Low": quotes.get("low") or closes,
+                 "Volume": quotes.get("volume") or [0] * len(closes)},
+                index=pd.to_datetime(timestamps, unit="s"),
+            ).dropna(subset=["Close"])
+        else:
+            df = pd.DataFrame()
+        return float(price), df, meta
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _safe_yf_call(fn, default=None):
@@ -208,15 +230,15 @@ def _safe_yf_call(fn, default=None):
 
 
 @st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
-def fetch_stock_data(sym, max_retries: int = 5):
+def fetch_stock_data(sym, max_retries: int = 3):
     """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff.
 
     Tolerates partial failures: as long as `info` (with a price) succeeds, we proceed
     even if financials / cashflow / balance_sheet / history individually fail.
-    Falls back to Stooq for price + history if Yahoo is hard-down.
+    Falls back to Yahoo's public chart endpoint (less rate-limited) for price +
+    history if Yahoo's `info` endpoint is hard-down.
     """
     last_err = None
-    info = None
     for attempt in range(max_retries):
         try:
             stk = yf.Ticker(sym, session=_YF_SESSION)
@@ -229,11 +251,11 @@ def fetch_stock_data(sym, max_retries: int = 5):
                 balance_sheet = _safe_yf_call(lambda: stk.balance_sheet, default=pd.DataFrame())
                 price_hist    = _safe_yf_call(lambda: stk.history(period="1y"), default=pd.DataFrame())
 
-                # If Yahoo gave us no history, fill from Stooq
+                # If Yahoo gave us no history, fill from chart endpoint
                 if price_hist is None or price_hist.empty:
-                    _, stooq_hist = _stooq_price(sym)
-                    if stooq_hist is not None:
-                        price_hist = stooq_hist
+                    _p, chart_hist, _m = _yahoo_chart_price(sym)
+                    if chart_hist is not None and not chart_hist.empty:
+                        price_hist = chart_hist
 
                 return {
                     "info": dict(info),
@@ -247,27 +269,36 @@ def fetch_stock_data(sym, max_retries: int = 5):
         except Exception as exc:
             last_err = str(exc)
 
-        # Exponential backoff with jitter: 2s, 5s, 11s, 23s, 47s
-        delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
+        # Exponential backoff with jitter: 2s, 5s, 11s
+        delay = min(2 * (2 ** attempt) + random.uniform(0, 1.5), 12)
         time.sleep(delay)
 
-    # Yahoo fully failed — try Stooq for at least the price so the app can run
-    stooq_close, stooq_hist = _stooq_price(sym)
-    if stooq_close is not None:
+    # Yahoo's info endpoint fully failed — try Yahoo's chart endpoint (different
+    # rate-limit bucket, used by Yahoo's own site) so the app can still run
+    chart_close, chart_hist, chart_meta = _yahoo_chart_price(sym)
+    if chart_close is not None:
+        meta = chart_meta or {}
         return {
             "info": {
-                "currentPrice": stooq_close,
-                "regularMarketPrice": stooq_close,
-                "longName": sym,
-                "sector": "N/A (Stooq fallback)",
-                "industry": "N/A (Stooq fallback)",
+                "currentPrice": chart_close,
+                "regularMarketPrice": chart_close,
+                "longName": meta.get("longName") or meta.get("shortName") or sym,
+                "shortName": meta.get("shortName") or sym,
+                "sector": "N/A (chart fallback)",
+                "industry": "N/A (chart fallback)",
                 "beta": 1.0,
+                "currency": meta.get("currency", "USD"),
+                "exchangeName": meta.get("exchangeName"),
             },
             "financials": pd.DataFrame(),
             "cashflow": pd.DataFrame(),
             "balance_sheet": pd.DataFrame(),
-            "price_hist": stooq_hist if stooq_hist is not None else pd.DataFrame(),
-            "error": "Yahoo Finance unavailable — using Stooq for price only. Enter fundamentals manually below.",
+            "price_hist": chart_hist if chart_hist is not None else pd.DataFrame(),
+            "error": (
+                "Yahoo Finance fundamentals endpoint is rate-limiting Streamlit Cloud's IPs. "
+                "Showing live price from Yahoo's chart endpoint — enter fundamentals manually below "
+                "to run the DCF."
+            ),
         }
 
     # Raise so the error is NOT cached — each call retries fresh
@@ -282,9 +313,26 @@ try:
     price_hist      = _data["price_hist"]
     stock_obj       = None  # no longer needed downstream
     fetch_error     = None
+    fetch_warning   = _data.get("error")  # chart-fallback message, if any
 except Exception as _e:
     info, financials, cashflow, balance_sheet, price_hist, stock_obj = (None,) * 6
     fetch_error = str(_e)
+    fetch_warning = None
+
+# Chart-fallback path: we have a price + history but no fundamentals.
+# Show a warning and offer manual input, but DON'T block the app — the user
+# can still see the price chart and run a manual DCF.
+if fetch_warning and info is not None:
+    st.warning(
+        f"⚠️ Partial data for **'{ticker_input}'**.\n\n"
+        f"{fetch_warning}\n\n"
+        f"Current price: **${info.get('currentPrice', 0):,.2f}**"
+    )
+    col_retry, _ = st.columns([1, 4])
+    with col_retry:
+        if st.button("🔄 Retry Full Data", type="primary", key="retry_partial"):
+            st.cache_data.clear()
+            st.rerun()
 
 if fetch_error or info is None:
     st.error(
