@@ -175,35 +175,100 @@ with st.sidebar:
 # Note: @st.cache_data requires return values to be picklable. The yfinance
 # Ticker object (especially with a curl_cffi session attached) is NOT picklable,
 # so we only return the serializable data (dict + DataFrames), not the Ticker.
+def _stooq_price(sym: str):
+    """Fallback price fetch from Stooq (no API key, no rate-limit on shared IPs).
+    Returns (latest_close, 1y price history DataFrame) or (None, None) on failure.
+    """
+    try:
+        import requests as _r
+        url = f"https://stooq.com/q/d/l/?s={sym.lower()}.us&i=d"
+        r = _r.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or not r.text or "Date" not in r.text:
+            return None, None
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
+        if df.empty or "Close" not in df.columns:
+            return None, None
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date").tail(252)
+        return float(df["Close"].iloc[-1]), df
+    except Exception:
+        return None, None
+
+
+def _safe_yf_call(fn, default=None):
+    """Call a yfinance accessor and return default on any failure (rate-limit, parse error, etc.)."""
+    try:
+        result = fn()
+        if result is None:
+            return default
+        return result
+    except Exception:
+        return default
+
+
 @st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
 def fetch_stock_data(sym, max_retries: int = 5):
-    """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff."""
+    """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff.
+
+    Tolerates partial failures: as long as `info` (with a price) succeeds, we proceed
+    even if financials / cashflow / balance_sheet / history individually fail.
+    Falls back to Stooq for price + history if Yahoo is hard-down.
+    """
     last_err = None
+    info = None
     for attempt in range(max_retries):
         try:
             stk = yf.Ticker(sym, session=_YF_SESSION)
-
             info = stk.info or {}
             price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if not info or price is None:
-                last_err = "Empty response from Yahoo Finance (likely rate-limited)."
-                # Exponential backoff with jitter: 2s, 5s, 11s, 23s, 47s
-                delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
-                time.sleep(delay)
-                continue
+            if info and price is not None:
+                # Got the critical piece — fetch the rest tolerantly
+                financials    = _safe_yf_call(lambda: stk.financials,    default=pd.DataFrame())
+                cashflow      = _safe_yf_call(lambda: stk.cashflow,      default=pd.DataFrame())
+                balance_sheet = _safe_yf_call(lambda: stk.balance_sheet, default=pd.DataFrame())
+                price_hist    = _safe_yf_call(lambda: stk.history(period="1y"), default=pd.DataFrame())
 
-            return {
-                "info": dict(info),
-                "financials": stk.financials,
-                "cashflow": stk.cashflow,
-                "balance_sheet": stk.balance_sheet,
-                "price_hist": stk.history(period="1y"),
-                "error": None,
-            }
+                # If Yahoo gave us no history, fill from Stooq
+                if price_hist is None or price_hist.empty:
+                    _, stooq_hist = _stooq_price(sym)
+                    if stooq_hist is not None:
+                        price_hist = stooq_hist
+
+                return {
+                    "info": dict(info),
+                    "financials": financials,
+                    "cashflow": cashflow,
+                    "balance_sheet": balance_sheet,
+                    "price_hist": price_hist,
+                    "error": None,
+                }
+            last_err = "Empty response from Yahoo Finance (likely rate-limited)."
         except Exception as exc:
             last_err = str(exc)
-            delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
-            time.sleep(delay)
+
+        # Exponential backoff with jitter: 2s, 5s, 11s, 23s, 47s
+        delay = min(2 * (2 ** attempt) + random.uniform(0, 2), 50)
+        time.sleep(delay)
+
+    # Yahoo fully failed — try Stooq for at least the price so the app can run
+    stooq_close, stooq_hist = _stooq_price(sym)
+    if stooq_close is not None:
+        return {
+            "info": {
+                "currentPrice": stooq_close,
+                "regularMarketPrice": stooq_close,
+                "longName": sym,
+                "sector": "N/A (Stooq fallback)",
+                "industry": "N/A (Stooq fallback)",
+                "beta": 1.0,
+            },
+            "financials": pd.DataFrame(),
+            "cashflow": pd.DataFrame(),
+            "balance_sheet": pd.DataFrame(),
+            "price_hist": stooq_hist if stooq_hist is not None else pd.DataFrame(),
+            "error": "Yahoo Finance unavailable — using Stooq for price only. Enter fundamentals manually below.",
+        }
 
     # Raise so the error is NOT cached — each call retries fresh
     raise RuntimeError(last_err or "Unknown error fetching data.")
