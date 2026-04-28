@@ -255,10 +255,83 @@ DEFAULTS = {
     "shares":          15300.0,    # millions
     "current_price":   210.00,     # $
     "edgar_data":      None,
+    "loaded_ticker":   "AAPL",     # which ticker the loaded data corresponds to
+    "edgar_msg":       None,       # ("success"|"warning"|"error", text) from last fetch
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def apply_edgar_autofill():
+    """Fetch EDGAR data for the current ticker and apply it to all inputs.
+
+    Used by both the explicit "Auto-fill" button AND the ticker on_change callback,
+    so changing the ticker (Tab/Enter) immediately refreshes the model.
+    Sets st.session_state.edgar_msg so the sidebar can render the result inline.
+    """
+    sym = (st.session_state.ticker or "").strip().upper()
+    if not sym:
+        return
+    edgar = fetch_edgar_fundamentals(sym)
+    if not edgar:
+        st.session_state.edgar_msg = ("error",
+            f"❌ Ticker **{sym}** not found in EDGAR. Use a US-listed ticker, "
+            "or enter values manually below.")
+        return
+    edgar_rev = edgar.get("revenue")
+    if not edgar_rev or edgar_rev <= 0:
+        st.session_state.edgar_data = None
+        st.session_state.edgar_msg = ("error",
+            f"⛔ **{edgar.get('name', sym)}** appears to be a **pre-revenue company** "
+            "(no operating revenue in latest 10-K). DCF requires positive cash flows. "
+            "Try a revenue-generating ticker (AAPL, MSFT, JNJ), or use asset-based valuation, "
+            "or enter values manually below.")
+        return
+
+    def _set(key, val, min_val=0):
+        if val is None: return
+        try: v = float(val)
+        except (TypeError, ValueError): return
+        if v <= min_val: return
+        st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
+
+    if edgar.get("name"):
+        st.session_state.company_name = edgar["name"]
+    _set("revenue", edgar.get("revenue"))
+    _set("margin",  edgar.get("ebit_margin"))
+    _set("shares",  edgar.get("shares"))
+    _set("growth",  edgar.get("revenue_cagr"))
+    if edgar.get("cash") is not None and edgar.get("cash") >= 0:
+        st.session_state.cash = round(edgar["cash"], 0)
+    if edgar.get("debt") is not None and edgar.get("debt") >= 0:
+        st.session_state.debt = round(edgar["debt"], 0)
+    if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
+        nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
+        if nopat > 0:
+            ri = min(100, edgar["capex"] / nopat * 100)
+            if ri > 0:
+                st.session_state.reinvest_rate = round(ri, 1)
+    st.session_state.edgar_data = edgar
+    st.session_state.loaded_ticker = sym
+    fy = edgar.get("fy_end", "?")
+    if edgar.get("ebit_margin") is None:
+        st.session_state.edgar_msg = ("warning",
+            f"⚠️ Loaded {edgar.get('name', sym)} (FY{fy}), but operating margin "
+            "couldn't be determined (likely a loss year). DCF will reflect your manual "
+            "margin assumption, not the company's actuals.")
+    elif edgar.get("missing"):
+        st.session_state.edgar_msg = ("warning",
+            f"⚠️ Loaded {edgar.get('name', sym)} (FY{fy}). EDGAR didn't have: "
+            f"**{', '.join(edgar['missing'])}** — left at default. Edit fields below if needed.")
+    else:
+        st.session_state.edgar_msg = ("success",
+            f"✅ Loaded {edgar.get('name', sym)} (FY{fy})")
+
+
+def on_ticker_change():
+    """Streamlit callback fired when the ticker text_input loses focus / Enter."""
+    apply_edgar_autofill()
 
 
 # =============================================================================
@@ -269,91 +342,38 @@ with st.sidebar:
 
     # ─── Ticker + EDGAR auto-fill ────────────────────────────────────────────
     st.subheader("🏢 Company")
-    st.text_input("Ticker", key="ticker", help="US-listed ticker (e.g. AAPL, MSFT, JNJ)")
+    st.text_input(
+        "Ticker", key="ticker",
+        on_change=on_ticker_change,
+        help="US-listed ticker (e.g. AAPL, MSFT, JNJ). Press Enter or Tab to auto-load EDGAR data.",
+    )
 
     col_a, col_b = st.columns([3, 2])
     with col_a:
-        if st.button("🔄 Auto-fill from EDGAR", use_container_width=True,
-                     help="Pull latest 10-K data from the SEC's official database (free, no API key)"):
-            with st.spinner("Fetching from SEC EDGAR..."):
-                edgar = fetch_edgar_fundamentals(st.session_state.ticker)
-            if edgar:
-                # ── Sanity check first: a DCF requires positive revenue. ──
-                # Pre-revenue companies (junior miners, early biotech, dev-stage SPACs)
-                # can't be valued via DCF — refuse to overwrite the user's working
-                # defaults with an inconsistent partial fill that produces nonsense.
-                edgar_rev = edgar.get("revenue")
-                if not edgar_rev or edgar_rev <= 0:
-                    st.session_state.edgar_data = None  # don't show the reference panel
-                    st.error(
-                        f"⛔ **{edgar.get('name', st.session_state.ticker)}** "
-                        "appears to be a **pre-revenue company** (no operating revenue in latest 10-K). "
-                        "DCF requires positive cash flows, so auto-fill won't work here. "
-                        "Suggestions:\n\n"
-                        "- Try a revenue-generating ticker (AAPL, MSFT, JNJ, KO)\n"
-                        "- For pre-revenue / dev-stage companies, use **asset-based valuation** instead\n"
-                        "- Or override Revenue, Margin, Shares manually below if you have a forecast"
-                    )
-                else:
-                    # Only overwrite a field when EDGAR returned a real (positive) value.
-                    # Missing / zero values are kept as the existing user input or default.
-                    def _set(key, val, min_val=0):
-                        if val is None: return
-                        try: v = float(val)
-                        except (TypeError, ValueError): return
-                        if v <= min_val: return
-                        st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
-
-                    if edgar.get("name"):
-                        st.session_state.company_name = edgar["name"]
-                    _set("revenue",  edgar.get("revenue"))
-                    _set("margin",   edgar.get("ebit_margin"))
-                    _set("shares",   edgar.get("shares"))
-                    _set("growth",   edgar.get("revenue_cagr"))
-                    # Cash and debt can legitimately be zero
-                    if edgar.get("cash") is not None and edgar.get("cash") >= 0:
-                        st.session_state.cash = round(edgar["cash"], 0)
-                    if edgar.get("debt") is not None and edgar.get("debt") >= 0:
-                        st.session_state.debt = round(edgar["debt"], 0)
-                    # Reinvestment rate ≈ CapEx / NOPAT — only compute if all parts valid
-                    if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
-                        nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
-                        if nopat > 0:
-                            ri = min(100, edgar["capex"] / nopat * 100)
-                            if ri > 0:
-                                st.session_state.reinvest_rate = round(ri, 1)
-
-                    st.session_state.edgar_data = edgar
-                    fy = edgar.get("fy_end", "?")
-
-                    # Warn if the company is unprofitable — DCF will still run but the
-                    # extrapolation from a loss-making base year is unreliable.
-                    if edgar.get("ebit_margin") is None:
-                        st.warning(
-                            f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}), "
-                            "but operating margin couldn't be determined (likely a loss-making year). "
-                            "DCF results will reflect your manual margin assumption, not the company's actuals."
-                        )
-                    elif edgar.get("missing"):
-                        st.warning(
-                            f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}). "
-                            f"EDGAR didn't have: **{', '.join(edgar['missing'])}** — "
-                            "left at default. Edit these fields below if needed."
-                        )
-                    else:
-                        st.success(f"✅ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy})")
-                    st.rerun()
-            else:
-                st.error(
-                    "❌ Ticker not found in EDGAR (or filings unavailable). "
-                    "EDGAR covers US-listed companies — try AAPL, MSFT, JNJ, etc. "
-                    "Or enter values manually below."
-                )
+        if st.button("🔄 Re-fetch from EDGAR", use_container_width=True,
+                     help="Re-pull latest 10-K data from SEC EDGAR for the current ticker"):
+            apply_edgar_autofill()
+            st.rerun()
     with col_b:
         if st.button("🧹 Reset", use_container_width=True, help="Reset all inputs to defaults"):
             for k, v in DEFAULTS.items():
                 st.session_state[k] = v
             st.rerun()
+
+    # ── Render the last EDGAR-fetch message inline (set by the callback / button) ──
+    msg = st.session_state.get("edgar_msg")
+    if msg:
+        kind, text = msg
+        {"success": st.success, "warning": st.warning, "error": st.error}[kind](text)
+
+    # ── Mismatch banner: ticker changed but data is stale (network failed?) ──
+    cur = (st.session_state.ticker or "").strip().upper()
+    loaded = (st.session_state.get("loaded_ticker") or "").strip().upper()
+    if cur and loaded and cur != loaded:
+        st.info(
+            f"📌 Inputs below currently reflect **{loaded}**. "
+            f"Press Enter or click 'Re-fetch from EDGAR' to load **{cur}**."
+        )
 
     st.text_input("Company Name", key="company_name")
 
@@ -487,7 +507,15 @@ mos              = (intrinsic_per - price) / intrinsic_per if intrinsic_per > 0 
 # =============================================================================
 # Page header — company + headline metrics
 # =============================================================================
-st.markdown(f"## 🏢 {company_name} ({ticker})")
+# If the loaded company name doesn't match the current ticker (user typed a new
+# ticker but autofill hasn't refreshed yet), show ticker only — never display a
+# stale company name that doesn't match the ticker.
+_loaded = (st.session_state.get("loaded_ticker") or "").strip().upper()
+_cur_t = (ticker or "").strip().upper()
+if _loaded == _cur_t and company_name:
+    st.markdown(f"## 🏢 {company_name} ({ticker})")
+else:
+    st.markdown(f"## 🏢 {ticker}")
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("DCF Intrinsic Value", f"${intrinsic_per:,.2f}")
