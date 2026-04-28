@@ -1237,19 +1237,25 @@ def build_excel_workbook():
         ws[col].alignment = center; ws[col].border = box
     ws.row_dimensions[4].height = 22
 
+    # All inputs the model needs to MATCH the website's output exactly.
+    # When the website has advanced features active (3-stage growth, margin
+    # expansion, mid-year, exit multiple, NWC drag), we write those values
+    # here so the Excel produces the same intrinsic value.
     inputs = [
-        ("Current Revenue",          revenue,                            "$M",  fmt_dollar),
-        ("Annual Growth Rate",       growth,                             "%",   fmt_pct),
-        ("EBIT Margin",              margin,                             "%",   fmt_pct),
-        ("Tax Rate",                 tax_rate,                           "%",   fmt_pct),
-        ("Reinvestment Rate",        reinvest_rate,                      "%",   fmt_pct),
-        ("WACC (Discount Rate)",     wacc,                               "%",   fmt_pct),
-        ("Terminal Growth Rate",     term_g,                             "%",   fmt_pct),
-        ("Forecast Years",           years,                              "yrs", "0"),
-        ("Total Debt",               debt,                               "$M",  fmt_dollar),
-        ("Cash & Equivalents",       cash,                               "$M",  fmt_dollar),
-        ("Shares Outstanding",       shares,                             "M",   fmt_int),
-        ("Current Stock Price",      price,                              "$",   fmt_dol2),
+        ("Current Revenue",          revenue,                                                   "$M",  fmt_dollar),
+        ("Tax Rate",                 tax_rate,                                                  "%",   fmt_pct),
+        ("Reinvestment Rate",        reinvest_rate,                                             "%",   fmt_pct),
+        ("ΔNWC (% of Δrevenue)",     st.session_state.nwc_pct/100,                              "%",   fmt_pct),
+        ("WACC (Discount Rate)",     wacc,                                                      "%",   fmt_pct),
+        ("Terminal Growth Rate",     term_g,                                                    "%",   fmt_pct),
+        ("Forecast Years",           years,                                                     "yrs", "0"),
+        ("Mid-year discounting (1/0)", 1 if st.session_state.mid_year else 0,                   "",    "0"),
+        ("Exit Multiple (1/0)",      1 if st.session_state.tv_method=="Exit Multiple" else 0,   "",    "0"),
+        ("Exit EV/EBITDA Multiple",  st.session_state.exit_multiple,                            "x",   "0.0"),
+        ("Total Debt",               debt,                                                      "$M",  fmt_dollar),
+        ("Cash & Equivalents",       cash,                                                      "$M",  fmt_dollar),
+        ("Shares Outstanding",       shares,                                                    "M",   fmt_int),
+        ("Current Stock Price",      price,                                                     "$",   fmt_dol2),
     ]
     INPUT_ROW = {}
     cur = 5
@@ -1263,22 +1269,48 @@ def build_excel_workbook():
         INPUT_ROW[label] = cur
         cur += 1
 
+    # Per-year growth & margin path table — captures Constant / 3-stage / Linear
+    # expansion modes. Whatever the website's active mode produced is written here;
+    # user can override any single year.
+    cur += 1
+    ws.cell(row=cur, column=1, value="Per-Year Growth & Margin").font = f_bold
+    cur += 1
+    ws.cell(row=cur, column=1, value="Year").font = f_hdr
+    ws.cell(row=cur, column=2, value="Growth Rate").font = f_hdr
+    ws.cell(row=cur, column=3, value="EBIT Margin").font = f_hdr
+    for c in range(1, 4):
+        ws.cell(row=cur, column=c).fill = fill_hdr
+        ws.cell(row=cur, column=c).alignment = center
+        ws.cell(row=cur, column=c).border = box
+    PATH_FIRST_ROW = cur + 1
+    for t in range(years):
+        r = PATH_FIRST_ROW + t
+        c1 = ws.cell(row=r, column=1, value=f"Year {t+1}")
+        c1.font = f_bold; c1.alignment = center; c1.border = box
+        c2 = ws.cell(row=r, column=2, value=growth_path[t])
+        c2.font = f_input; c2.alignment = right; c2.border = box; c2.number_format = fmt_pct
+        c3 = ws.cell(row=r, column=3, value=margin_path[t])
+        c3.font = f_input; c3.alignment = right; c3.border = box; c3.number_format = fmt_pct
+
+    # Cell references
     REV_CELL    = f"Inputs!$B${INPUT_ROW['Current Revenue']}"
-    GROWTH_CELL = f"Inputs!$B${INPUT_ROW['Annual Growth Rate']}"
-    MARGIN_CELL = f"Inputs!$B${INPUT_ROW['EBIT Margin']}"
     TAX_CELL    = f"Inputs!$B${INPUT_ROW['Tax Rate']}"
     REINV_CELL  = f"Inputs!$B${INPUT_ROW['Reinvestment Rate']}"
+    NWC_CELL    = f"Inputs!$B${INPUT_ROW['ΔNWC (% of Δrevenue)']}"
     WACC_CELL   = f"Inputs!$B${INPUT_ROW['WACC (Discount Rate)']}"
     TG_CELL     = f"Inputs!$B${INPUT_ROW['Terminal Growth Rate']}"
     YEARS_CELL  = f"Inputs!$B${INPUT_ROW['Forecast Years']}"
+    MIDYR_CELL  = f"Inputs!$B${INPUT_ROW['Mid-year discounting (1/0)']}"
+    TVMETH_CELL = f"Inputs!$B${INPUT_ROW['Exit Multiple (1/0)']}"
+    EXITMULT_CELL = f"Inputs!$B${INPUT_ROW['Exit EV/EBITDA Multiple']}"
     DEBT_CELL   = f"Inputs!$B${INPUT_ROW['Total Debt']}"
     CASH_CELL   = f"Inputs!$B${INPUT_ROW['Cash & Equivalents']}"
     SHARES_CELL = f"Inputs!$B${INPUT_ROW['Shares Outstanding']}"
     PRICE_CELL  = f"Inputs!$B${INPUT_ROW['Current Stock Price']}"
 
-    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 16
-    ws.column_dimensions["C"].width = 8
+    ws.column_dimensions["C"].width = 12
 
     # =====================================================================
     # SHEET 2 — DCF Model (wide format: years as columns, formulas everywhere)
@@ -1305,20 +1337,23 @@ def build_excel_workbook():
         c.font = f_hdr; c.fill = fill_hdr; c.alignment = center; c.border = box
     wsm.row_dimensions[4].height = 22
 
-    # ── Revenue Build ──
+    # ── Revenue Build (uses per-year growth from path table on Inputs) ──
     wsm.cell(row=6, column=1, value="Revenue").font = f_bold
     wsm.cell(row=6, column=1).alignment = indent
     wsm.cell(row=6, column=2, value=f"={REV_CELL}").number_format = fmt_dollar
     for t in range(1, years + 1):
         col = 2 + t; prev = get_column_letter(col - 1)
-        wsm.cell(row=6, column=col, value=f"={prev}6*(1+{GROWTH_CELL})").number_format = fmt_dollar
+        path_row = PATH_FIRST_ROW + (t - 1)
+        wsm.cell(row=6, column=col,
+            value=f"={prev}6*(1+Inputs!$B${path_row})").number_format = fmt_dollar
 
-    # ── EBIT = Revenue × Margin ──
+    # ── EBIT Margin (per-year from path table) ──
     wsm.cell(row=7, column=1, value="× EBIT Margin").alignment = indent
     wsm.cell(row=7, column=2, value="—").alignment = center
     for t in range(1, years + 1):
         col = 2 + t
-        wsm.cell(row=7, column=col, value=f"={MARGIN_CELL}").number_format = fmt_pct
+        path_row = PATH_FIRST_ROW + (t - 1)
+        wsm.cell(row=7, column=col, value=f"=Inputs!$C${path_row}").number_format = fmt_pct
 
     wsm.cell(row=8, column=1, value="= EBIT").font = f_bold
     wsm.cell(row=8, column=1).alignment = indent
@@ -1341,38 +1376,48 @@ def build_excel_workbook():
         col = 2 + t; col_letter = get_column_letter(col)
         wsm.cell(row=10, column=col, value=f"={col_letter}8*{col_letter}9").number_format = fmt_dollar
 
-    # ── FCF = NOPAT × (1 - Reinvestment) ──
-    wsm.cell(row=11, column=1, value="× (1 − Reinvestment Rate)").alignment = indent
+    # ── Reinvestment ──
+    wsm.cell(row=11, column=1, value="(−) Reinvestment").alignment = indent
     wsm.cell(row=11, column=2, value="—").alignment = center
     for t in range(1, years + 1):
-        col = 2 + t
-        wsm.cell(row=11, column=col, value=f"=1-{REINV_CELL}").number_format = fmt_pct
+        col = 2 + t; col_letter = get_column_letter(col)
+        wsm.cell(row=11, column=col, value=f"=-{col_letter}10*{REINV_CELL}").number_format = fmt_dollar
 
-    wsm.cell(row=12, column=1, value="= Free Cash Flow").font = f_summary
-    wsm.cell(row=12, column=1).fill = fill_sum
-    wsm.cell(row=12, column=1).alignment = indent
-    wsm.cell(row=12, column=1).border = high
+    # ── ΔNWC drag (matches website's NWC line) ──
+    wsm.cell(row=12, column=1, value="(−) ΔNWC").alignment = indent
     wsm.cell(row=12, column=2, value="—").alignment = center
-    wsm.cell(row=12, column=2).fill = fill_sum; wsm.cell(row=12, column=2).border = high
+    for t in range(1, years + 1):
+        col = 2 + t; col_letter = get_column_letter(col); prev = get_column_letter(col - 1)
+        wsm.cell(row=12, column=col,
+            value=f"=-MAX(0,({col_letter}6-{prev}6)*{NWC_CELL})").number_format = fmt_dollar
+
+    # ── FCF (highlighted) ──
+    wsm.cell(row=13, column=1, value="= Free Cash Flow").font = f_summary
+    wsm.cell(row=13, column=1).fill = fill_sum; wsm.cell(row=13, column=1).alignment = indent
+    wsm.cell(row=13, column=1).border = high
+    wsm.cell(row=13, column=2, value="—").alignment = center
+    wsm.cell(row=13, column=2).fill = fill_sum; wsm.cell(row=13, column=2).border = high
     for t in range(1, years + 1):
         col = 2 + t; col_letter = get_column_letter(col)
-        c = wsm.cell(row=12, column=col, value=f"={col_letter}10*{col_letter}11")
+        c = wsm.cell(row=13, column=col, value=f"={col_letter}10+{col_letter}11+{col_letter}12")
         c.number_format = fmt_dollar; c.font = f_summary
         c.fill = fill_sum; c.border = high
 
-    # ── Discount Factor & PV ──
-    wsm.cell(row=14, column=1, value="Discount Factor: 1/(1+WACC)^t").alignment = indent
-    wsm.cell(row=14, column=2, value="—").alignment = center
-    for t in range(1, years + 1):
-        col = 2 + t
-        wsm.cell(row=14, column=col, value=f"=1/(1+{WACC_CELL})^{t}").number_format = fmt_factor
-
-    wsm.cell(row=15, column=1, value="PV of FCF").font = f_bold
-    wsm.cell(row=15, column=1).alignment = indent
+    # ── Discount Factor (mid-year aware via the 1/0 flag) & PV ──
+    wsm.cell(row=15, column=1,
+        value="Discount Factor: 1/(1+WACC)^(t − 0.5×midyr)").alignment = indent
     wsm.cell(row=15, column=2, value="—").alignment = center
     for t in range(1, years + 1):
+        col = 2 + t
+        wsm.cell(row=15, column=col,
+            value=f"=1/(1+{WACC_CELL})^({t}-0.5*{MIDYR_CELL})").number_format = fmt_factor
+
+    wsm.cell(row=16, column=1, value="PV of FCF").font = f_bold
+    wsm.cell(row=16, column=1).alignment = indent
+    wsm.cell(row=16, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
         col = 2 + t; col_letter = get_column_letter(col)
-        wsm.cell(row=15, column=col, value=f"={col_letter}12*{col_letter}14").number_format = fmt_dollar
+        wsm.cell(row=16, column=col, value=f"={col_letter}13*{col_letter}15").number_format = fmt_dollar
 
     # ── Valuation Summary ──
     last_yr_col = get_column_letter(2 + years)
@@ -1380,35 +1425,40 @@ def build_excel_workbook():
     pv_last     = get_column_letter(2 + years)
 
     summary = [
-        ("Sum of PV of FCFs",       f"=SUM({pv_first}15:{pv_last}15)"),
-        ("Terminal FCF (Yr N+1)",   f"={last_yr_col}12*(1+{TG_CELL})"),
-        ("Terminal Value",          f"=B19/({WACC_CELL}-{TG_CELL})"),
-        ("PV of Terminal Value",    f"=B20/(1+{WACC_CELL})^{YEARS_CELL}"),
-        ("Enterprise Value",        f"=B18+B21"),
+        ("Sum of PV of FCFs",       f"=SUM({pv_first}16:{pv_last}16)"),
+        ("Terminal FCF (Yr N+1)",   f"={last_yr_col}13*(1+{TG_CELL})"),
+        # IF Exit Multiple (TVMETH=1): exit_mult × terminal-year EBIT × 1.15 (EBITDA proxy)
+        # ELSE Gordon Growth: terminal_FCF / (WACC − g)
+        ("Terminal Value",
+            f"=IF({TVMETH_CELL}=1,"
+            f"{EXITMULT_CELL}*{last_yr_col}8*1.15,"
+            f"B20/({WACC_CELL}-{TG_CELL}))"),
+        ("PV of Terminal Value",
+            f"=B21/(1+{WACC_CELL})^({YEARS_CELL}-0.5*{MIDYR_CELL})"),
+        ("Enterprise Value",        f"=B19+B22"),
         ("(−) Total Debt",          f"=-{DEBT_CELL}"),
         ("(+) Cash & Equivalents",  f"={CASH_CELL}"),
-        ("Equity Value",            f"=B22+B23+B24"),
+        ("Equity Value",            f"=B23+B24+B25"),
         ("÷ Shares Outstanding",    f"={SHARES_CELL}"),
-        ("Intrinsic Value / Share", f"=B25/B26"),
+        ("Intrinsic Value / Share", f"=B26/B27"),
         ("Current Market Price",    f"={PRICE_CELL}"),
-        ("Upside / (Downside)",     f"=B27/B28-1"),
+        ("Upside / (Downside)",     f"=B28/B29-1"),
     ]
     formats = [fmt_dollar, fmt_dollar, fmt_dollar, fmt_dollar, fmt_dollar,
                fmt_dollar, fmt_dollar, fmt_dollar, fmt_int, fmt_dol2, fmt_dol2, fmt_pct]
 
     # Section header for summary
-    sh = wsm.cell(row=17, column=1, value="Valuation Summary")
+    sh = wsm.cell(row=18, column=1, value="Valuation Summary")
     sh.font = f_hdr; sh.fill = fill_hdr; sh.alignment = indent
-    wsm.merge_cells(start_row=17, start_column=1, end_row=17, end_column=2 + years)
-    wsm.row_dimensions[17].height = 20
+    wsm.merge_cells(start_row=18, start_column=1, end_row=18, end_column=2 + years)
+    wsm.row_dimensions[18].height = 20
 
     for i, (label, formula) in enumerate(summary):
-        r = 18 + i
+        r = 19 + i
         c1 = wsm.cell(row=r, column=1, value=label)
         c1.font = f_bold; c1.alignment = indent; c1.border = box
         c2 = wsm.cell(row=r, column=2, value=formula)
         c2.alignment = right; c2.border = box; c2.number_format = formats[i]
-        # Highlight the headline intrinsic-value row
         if "Intrinsic Value" in label:
             c1.font = f_summary; c1.fill = fill_sum; c1.border = high
             c2.font = f_summary; c2.fill = fill_sum; c2.border = high
