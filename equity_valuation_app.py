@@ -946,18 +946,29 @@ st.markdown("---")
 # =============================================================================
 st.markdown("## 📊 Sensitivity Analysis")
 st.caption("Intrinsic value per share under different assumption combinations. "
-           "Color: 🟢 >20% upside · 🟡 ±20% · 🔴 >20% downside.")
+           "Color scale: 🔴 lowest value → 🟡 mid → 🟢 highest value within each table.")
 
-def style_iv(val):
-    """Color cell by upside vs current market price."""
-    try:
-        v = float(val.replace("$", "").replace(",", ""))
-    except Exception:
+# Smooth red→yellow→green colormap that works on both light and dark themes.
+# Uses HSL: red (0°) → yellow (60°) → green (120°), with low saturation to keep
+# text readable. Returns CSS background strings for pandas Styler.applymap.
+def _gradient_style(val, vmin, vmax):
+    if pd.isna(val) or vmax == vmin:
         return ""
-    diff = (v - price) / price if price > 0 else 0
-    if diff > 0.20:    return "background-color: #c8e6c9"   # green
-    elif diff < -0.20: return "background-color: #ffcdd2"   # red
-    else:              return "background-color: #fff9c4"   # yellow
+    ratio = max(0, min(1, (val - vmin) / (vmax - vmin)))
+    hue = int(120 * ratio)              # 0 = red, 60 = yellow, 120 = green
+    return f"background-color: hsl({hue}, 65%, 78%); color: #111;"
+
+def style_table_gradient(df):
+    """Apply a per-table red→green gradient based on numeric cell values.
+    Min value in the table → red, max → green, linear interpolation between.
+    """
+    flat = df.stack().dropna()
+    if flat.empty:
+        return df.style.format("${:,.2f}")
+    vmin, vmax = float(flat.min()), float(flat.max())
+    return (df.style
+            .format("${:,.2f}")
+            .map(lambda v: _gradient_style(v, vmin, vmax) if pd.notna(v) else ""))
 
 # Table 1: WACC × Terminal Growth
 # Run DCF with given overrides; reuses the live growth/margin paths and all advanced settings
@@ -998,10 +1009,7 @@ df1 = pd.DataFrame(
     index=[f"WACC={w*100:.2f}%" for w in wacc_range if w > 0],
     columns=[f"g={tg*100:.2f}%" for tg in tg_range],
 )
-st.dataframe(
-    df1.style.format("${:,.2f}").map(lambda v: style_iv(f"${v:,.2f}") if pd.notna(v) else ""),
-    use_container_width=True,
-)
+st.dataframe(style_table_gradient(df1), use_container_width=True)
 
 # Table 2: Growth × Margin
 st.markdown("### Table 2 — Intrinsic Value: Growth Rate vs. EBIT Margin")
@@ -1021,10 +1029,7 @@ df2 = pd.DataFrame(
     index=[f"g={g*100:.2f}%" for g in g_range],
     columns=[f"margin={m*100:.2f}%" for m in m_range],
 )
-st.dataframe(
-    df2.style.format("${:,.2f}").map(lambda v: style_iv(f"${v:,.2f}") if pd.notna(v) else ""),
-    use_container_width=True,
-)
+st.dataframe(style_table_gradient(df2), use_container_width=True)
 
 
 st.markdown("---")
