@@ -1074,260 +1074,683 @@ st.caption(
 )
 
 def build_excel_workbook():
-    """Build a fully editable Excel workbook that mirrors the live app's DCF.
+    """Build a professional, editable DCF workbook that mirrors the live app.
 
-    Reflects all active modeling settings: per-year growth & margin paths
-    (from constant / 3-stage / linear-expansion modes), CAPM WACC build-up,
-    Gordon Growth vs Exit Multiple terminal value, mid-year discounting,
-    and ΔNWC drag. Edit any input on the Inputs sheet → projection auto-recalcs.
+    Layout follows banker conventions: years as columns (wide format), sectioned
+    line items with header bars, blue-font input cells, summary highlight box,
+    conditional formatting on sensitivity, frozen panes, tab colors, and a
+    clean cover sheet. All formulas reference the Inputs sheet so users can
+    modify any assumption and the entire model recomputes.
     """
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.utils import get_column_letter
+
+    # ── Style palette (consistent across all sheets) ─────────────────────────
+    NAVY        = "1F4E79"
+    LIGHT_BLUE  = "D9E2F3"
+    SOFT_GREEN  = "C5E0B4"
+    SOFT_GREY   = "F2F2F2"
+    INPUT_BLUE  = "0070C0"   # banker convention: input cells in blue font
+    BORDER_GREY = "BFBFBF"
+    BORDER_DARK = "808080"
+
+    base_font     = Font(name="Calibri", size=10)
+    bold_font     = Font(name="Calibri", size=10, bold=True)
+    italic_font   = Font(name="Calibri", size=9, italic=True, color="595959")
+    input_font    = Font(name="Calibri", size=10, color=INPUT_BLUE)         # editable inputs
+    title_font    = Font(name="Calibri", size=20, bold=True, color=NAVY)
+    subtitle_font = Font(name="Calibri", size=12, color="595959")
+    section_font  = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_font_w = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    summary_font  = Font(name="Calibri", size=12, bold=True, color=NAVY)
+
+    section_fill   = PatternFill("solid", fgColor=NAVY)
+    subhead_fill   = PatternFill("solid", fgColor=LIGHT_BLUE)
+    summary_fill   = PatternFill("solid", fgColor=SOFT_GREEN)
+    striped_fill   = PatternFill("solid", fgColor=SOFT_GREY)
+
+    thin  = Side(style="thin", color=BORDER_GREY)
+    thick = Side(style="medium", color=BORDER_DARK)
+    box_border  = Border(left=thin, right=thin, top=thin, bottom=thin)
+    top_border  = Border(top=thick)
+    btm_border  = Border(bottom=thick)
+
+    center = Alignment(horizontal="center", vertical="center")
+    right  = Alignment(horizontal="right",  vertical="center")
+    left   = Alignment(horizontal="left",   vertical="center", indent=0)
+    indent = Alignment(horizontal="left",   vertical="center", indent=1)
+
+    fmt_pct      = "0.00%"
+    fmt_pct1     = "0.0%"
+    fmt_dollar   = "$#,##0;($#,##0)"
+    fmt_dollar2  = "$#,##0.00;($#,##0.00)"
+    fmt_int      = "#,##0;(#,##0)"
+    fmt_factor   = "0.0000"
+    fmt_x        = "0.0\\x"
+
+    def section_bar(ws, row, col_start, col_end, label):
+        """Navy header bar spanning columns col_start..col_end."""
+        ws.cell(row=row, column=col_start, value=label).font = section_font
+        ws.cell(row=row, column=col_start).fill = section_fill
+        ws.cell(row=row, column=col_start).alignment = left
+        for c in range(col_start + 1, col_end + 1):
+            ws.cell(row=row, column=c).fill = section_fill
+        ws.merge_cells(start_row=row, start_column=col_start, end_row=row, end_column=col_end)
+        ws.cell(row=row, column=col_start).alignment = Alignment(horizontal="left", vertical="center", indent=1)
 
     wb = Workbook()
 
-    # ─── Inputs sheet ────────────────────────────────────────────────────────
-    ws = wb.active
-    ws.title = "Inputs"
-    bold = Font(bold=True)
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    header_font = Font(bold=True, color="FFFFFF")
-    italic_grey = Font(italic=True, color="666666")
+    # =====================================================================
+    # SHEET 1 — Cover / Summary
+    # =====================================================================
+    ws1 = wb.active
+    ws1.title = "Summary"
+    ws1.sheet_properties.tabColor = NAVY
+    ws1.sheet_view.showGridLines = False
 
-    # Single-value inputs (editable). Order matters — cell refs below use these row numbers.
-    inputs = [
-        ("Company Name",                    company_name,        ""),                                  # 2
-        ("Ticker",                          ticker,              ""),                                  # 3
-        ("Current Revenue",                 revenue,             "$M"),                                # 4
-        ("Tax Rate",                        tax_rate,            "decimal"),                           # 5
-        ("Reinvestment Rate",               reinvest_rate,       "decimal"),                           # 6
-        ("WACC",                            wacc,                "decimal"),                           # 7
-        ("Terminal Growth Rate",            term_g,              "decimal"),                           # 8
-        ("Forecast Years",                  years,               ""),                                  # 9
-        ("Total Debt",                      debt,                "$M"),                                # 10
-        ("Cash & Equivalents",              cash,                "$M"),                                # 11
-        ("Shares Outstanding",              shares,              "millions"),                          # 12
-        ("Current Stock Price",             price,               "$"),                                 # 13
-        ("ΔNWC (% of Δrevenue)",            st.session_state.nwc_pct/100, "decimal"),                  # 14
-        ("Mid-year discounting (1=on)",     1 if st.session_state.mid_year else 0, ""),                # 15
-        ("TV method (0=Gordon, 1=ExitMul)", 1 if st.session_state.tv_method=="Exit Multiple" else 0,""),# 16
-        ("Exit EV/EBITDA Multiple",         st.session_state.exit_multiple, "x"),                      # 17
+    # Big title
+    ws1.merge_cells("B2:G2"); ws1["B2"] = "DCF Equity Valuation"
+    ws1["B2"].font = title_font; ws1["B2"].alignment = left
+    ws1.merge_cells("B3:G3"); ws1["B3"] = f"{company_name} ({ticker})"
+    ws1["B3"].font = Font(name="Calibri", size=14, color="595959"); ws1["B3"].alignment = left
+    ws1.merge_cells("B4:G4"); ws1["B4"] = f"Generated {datetime.now().strftime('%B %d, %Y')}"
+    ws1["B4"].font = subtitle_font; ws1["B4"].alignment = left
+
+    # Headline metrics box
+    section_bar(ws1, 7, 2, 7, "Valuation Headline")
+    headline = [
+        ("DCF Intrinsic Value per Share",  f"='DCF Model'!{get_column_letter(2 + years + 1)}{1}",  fmt_dollar2),
+        ("Current Market Price",           f"=Inputs!$B$13",                                       fmt_dollar2),
+        ("Upside / (Downside)",            None,                                                   fmt_pct),
+        ("Margin of Safety",               None,                                                   fmt_pct),
     ]
+    # Will fill formulas after DCF Model rows are known — fill with placeholders for now
+    for i, (label, _, fmt) in enumerate(headline):
+        r = 8 + i
+        c1 = ws1.cell(row=r, column=2, value=label)
+        c1.font = bold_font; c1.alignment = indent; c1.border = box_border
+        ws1.cell(row=r, column=3).border = box_border
+        ws1.cell(row=r, column=3).alignment = right
+        ws1.cell(row=r, column=3).number_format = fmt
+        # Apply summary highlight on the intrinsic-value row
+        if "Intrinsic" in label:
+            c1.font = summary_font; c1.fill = summary_fill
+            ws1.cell(row=r, column=3).font = summary_font
+            ws1.cell(row=r, column=3).fill = summary_fill
 
-    ws["A1"] = "Input"; ws["B1"] = "Value"; ws["C1"] = "Unit"
-    for c in ["A1", "B1", "C1"]:
-        ws[c].font = header_font; ws[c].fill = header_fill
-    for i, (label, val, unit) in enumerate(inputs, start=2):
-        ws.cell(row=i, column=1, value=label).font = bold
-        ws.cell(row=i, column=2, value=val)
-        ws.cell(row=i, column=3, value=unit)
-    ws.column_dimensions["A"].width = 30
-    ws.column_dimensions["B"].width = 16
-    ws.column_dimensions["C"].width = 12
+    # Quick-reference assumptions block
+    section_bar(ws1, 14, 2, 7, "Key Assumptions")
+    quick_ref = [
+        ("Forecast Period",          f"=Inputs!$B$9 & \" years\""),
+        ("WACC",                     f"=Inputs!$B$7"),
+        ("Terminal Growth Rate",     f"=Inputs!$B$8"),
+        ("Tax Rate",                 f"=Inputs!$B$5"),
+        ("Reinvestment Rate",        f"=Inputs!$B$6"),
+        ("ΔNWC (% of Δrevenue)",     f"=Inputs!$B$14"),
+    ]
+    for i, (label, formula) in enumerate(quick_ref):
+        r = 15 + i
+        c1 = ws1.cell(row=r, column=2, value=label)
+        c1.font = bold_font; c1.alignment = indent
+        c2 = ws1.cell(row=r, column=3, value=formula)
+        c2.alignment = right
+        if "Years" not in label:
+            c2.number_format = fmt_pct
+        c1.border = box_border; c2.border = box_border
 
-    # Named cell references for downstream formulas
-    REV_CELL    = "Inputs!$B$4"
-    TAX_CELL    = "Inputs!$B$5"
-    REINV_CELL  = "Inputs!$B$6"
-    WACC_CELL   = "Inputs!$B$7"
-    TG_CELL     = "Inputs!$B$8"
-    DEBT_CELL   = "Inputs!$B$10"
-    CASH_CELL   = "Inputs!$B$11"
-    SHARES_CELL = "Inputs!$B$12"
-    PRICE_CELL  = "Inputs!$B$13"
-    NWC_CELL    = "Inputs!$B$14"
-    MIDYR_CELL  = "Inputs!$B$15"
-    TVMETH_CELL = "Inputs!$B$16"
-    EXITMULT_CELL = "Inputs!$B$17"
-
-    # ── Per-year growth + margin path table (editable; supports any modeling mode)
-    PATH_HEADER_ROW = 19
-    ws.cell(row=PATH_HEADER_ROW, column=1, value="Per-year Path (editable)").font = bold
-    ws.cell(row=PATH_HEADER_ROW, column=2, value="Growth Rate")
-    ws.cell(row=PATH_HEADER_ROW, column=3, value="EBIT Margin")
-    for c in range(1, 4):
-        ws.cell(row=PATH_HEADER_ROW, column=c).font = header_font
-        ws.cell(row=PATH_HEADER_ROW, column=c).fill = header_fill
-
-    for t in range(years):
-        r = PATH_HEADER_ROW + 1 + t
-        ws.cell(row=r, column=1, value=f"Year {t+1}").font = bold
-        ws.cell(row=r, column=2, value=growth_path[t]).number_format = "0.00%"
-        ws.cell(row=r, column=3, value=margin_path[t]).number_format = "0.00%"
-
-    PATH_FIRST_ROW = PATH_HEADER_ROW + 1  # row of Year 1 path
-
-    # Note rows below
-    note_row = PATH_FIRST_ROW + years + 1
-    ws.cell(row=note_row, column=1,
-        value=f"Modeling notes (active settings — change inputs above to override):").font = bold
-    notes = [
-        f"Growth mode:  {st.session_state.growth_mode}",
-        f"Margin mode:  {st.session_state.margin_mode}",
-        f"WACC mode:    {st.session_state.wacc_mode}"
+    # Modeling settings note
+    section_bar(ws1, 23, 2, 7, "Active Modeling Settings")
+    settings_text = [
+        f"Growth path:   {st.session_state.growth_mode}",
+        f"Margin path:   {st.session_state.margin_mode}",
+        f"WACC mode:     {st.session_state.wacc_mode}"
                 + (f"  (Rf={st.session_state.rf:.2f}%, β={st.session_state.beta:.2f}, "
                    f"ERP={st.session_state.erp:.2f}%, Rd={st.session_state.rd_pretax:.2f}%, "
                    f"D/V={st.session_state.weight_debt:.0f}%)"
                    if st.session_state.wacc_mode == "CAPM build-up" else ""),
-        f"TV method:    {st.session_state.tv_method}"
+        f"Terminal value: {st.session_state.tv_method}"
                 + (f"  ({st.session_state.exit_multiple:.1f}x EV/EBITDA)"
                    if st.session_state.tv_method == "Exit Multiple" else ""),
-        f"Mid-year discounting: {'ON' if st.session_state.mid_year else 'OFF'}",
-        f"ΔNWC drag: {st.session_state.nwc_pct:.1f}% of Δrevenue",
+        f"Discounting:   {'Mid-year convention' if st.session_state.mid_year else 'End-of-year convention'}",
     ]
-    for i, n in enumerate(notes):
-        ws.cell(row=note_row+1+i, column=1, value=n).font = italic_grey
+    for i, t in enumerate(settings_text):
+        c = ws1.cell(row=24 + i, column=2, value=t)
+        c.font = italic_font; c.alignment = indent
+        ws1.merge_cells(start_row=24+i, start_column=2, end_row=24+i, end_column=7)
 
-    # ─── DCF Projection sheet ────────────────────────────────────────────────
-    ws2 = wb.create_sheet("DCF Projection")
-    headers = ["Year", "Growth", "Margin", "Revenue ($M)", "EBIT ($M)", "NOPAT ($M)",
-               "Reinvest ($M)", "ΔNWC ($M)", "FCF ($M)", "Discount Factor", "PV of FCF ($M)"]
-    for col, h in enumerate(headers, start=1):
-        c = ws2.cell(row=1, column=col, value=h)
-        c.font = header_font; c.fill = header_fill
+    # Column widths
+    ws1.column_dimensions["A"].width = 2
+    ws1.column_dimensions["B"].width = 36
+    for col in ["C", "D", "E", "F", "G"]:
+        ws1.column_dimensions[col].width = 16
 
-    # Year 0 (base) — only Revenue is meaningful
-    ws2.cell(row=2, column=1, value=0)
-    ws2.cell(row=2, column=4, value=f"={REV_CELL}")
+    # =====================================================================
+    # SHEET 2 — Inputs
+    # =====================================================================
+    ws = wb.create_sheet("Inputs")
+    ws.sheet_properties.tabColor = "8FAADC"
+    ws.sheet_view.showGridLines = False
 
-    # Forecast years 1..N — every cell is a formula referencing Inputs
-    for t in range(1, years + 1):
-        row = t + 2
-        # Path row in the Inputs sheet for this year:
-        path_row = PATH_FIRST_ROW + (t - 1)
-        ws2.cell(row=row, column=1, value=t)
-        ws2.cell(row=row, column=2, value=f"=Inputs!$B${path_row}")                    # Growth
-        ws2.cell(row=row, column=3, value=f"=Inputs!$C${path_row}")                    # Margin
-        ws2.cell(row=row, column=4, value=f"=D{row-1}*(1+B{row})")                     # Revenue
-        ws2.cell(row=row, column=5, value=f"=D{row}*C{row}")                           # EBIT
-        ws2.cell(row=row, column=6, value=f"=E{row}*(1-{TAX_CELL})")                   # NOPAT
-        ws2.cell(row=row, column=7, value=f"=F{row}*{REINV_CELL}")                     # Reinvestment
-        ws2.cell(row=row, column=8, value=f"=MAX(0,(D{row}-D{row-1})*{NWC_CELL})")     # ΔNWC
-        ws2.cell(row=row, column=9, value=f"=F{row}-G{row}-H{row}")                    # FCF
-        # Discount factor: end-year (1+W)^t  OR  mid-year (1+W)^(t-0.5)
-        ws2.cell(row=row, column=10,
-            value=f"=1/(1+{WACC_CELL})^(A{row}-0.5*{MIDYR_CELL})")                     # DF
-        ws2.cell(row=row, column=11, value=f"=I{row}*J{row}")                          # PV
+    # Title
+    ws.merge_cells("A1:C1"); ws["A1"] = "Model Inputs"
+    ws["A1"].font = title_font; ws["A1"].alignment = left
+    ws.merge_cells("A2:C2")
+    ws["A2"] = "Edit blue-font cells. The DCF Model sheet recomputes automatically."
+    ws["A2"].font = italic_font
 
-    last_data_row = years + 2
+    # Inputs organized by section. Rows with kind='formula' are computed in Excel
+    # (read-only — derived from other cells). Rows with kind='dropdown' get data validation.
+    # kind='input' is the standard editable case.
+    inputs = [
+        ("__SECTION__", "Company", None, None),
+        ("Company Name",                  company_name,                                              "",      "input"),
+        ("Ticker",                        ticker,                                                    "",      "input"),
 
-    # Format numeric cells
-    for r in range(2, last_data_row + 1):
-        ws2.cell(row=r, column=2).number_format = "0.00%"
-        ws2.cell(row=r, column=3).number_format = "0.00%"
-        for c in range(4, 10):
-            ws2.cell(row=r, column=c).number_format = "#,##0"
-        ws2.cell(row=r, column=10).number_format = "0.0000"
-        ws2.cell(row=r, column=11).number_format = "#,##0"
+        ("__SECTION__", "Income Statement", None, None),
+        ("Current Revenue",               revenue,                                                   "$M",    "input"),
+        ("Tax Rate",                      tax_rate,                                                  "%",     "input"),
+        ("Reinvestment Rate",             reinvest_rate,                                             "%",     "input"),
+        ("ΔNWC (% of Δrevenue)",          st.session_state.nwc_pct/100,                              "%",     "input"),
 
-    # ─── Valuation summary (same sheet) ─────────────────────────────────────
-    summary_start = last_data_row + 3
-    # Compute the dual TV formula (Gordon vs Exit Multiple)
-    last_fcf_cell  = f"I{last_data_row}"
-    last_ebit_cell = f"E{last_data_row}"
+        ("__SECTION__", "Discount Rate (WACC) Build-up", None, None),
+        ("WACC mode",
+            "CAPM build-up" if st.session_state.wacc_mode == "CAPM build-up" else "Direct",
+            "",      "dropdown_wacc"),
+        ("Direct WACC entry",             wacc,                                                      "%",     "input"),
+        ("Risk-free Rate (Rf)",           st.session_state.rf/100,                                   "%",     "input"),
+        ("Beta (β)",                      st.session_state.beta,                                     "",      "input"),
+        ("Equity Risk Premium (ERP)",     st.session_state.erp/100,                                  "%",     "input"),
+        ("Pre-tax Cost of Debt (Rd)",     st.session_state.rd_pretax/100,                            "%",     "input"),
+        ("Target Debt Weight (D/V)",      st.session_state.weight_debt/100,                          "%",     "input"),
+        ("Cost of Equity (computed)",     "FORMULA_RE",                                              "%",     "formula"),
+        ("After-tax Cost of Debt",        "FORMULA_ATRD",                                            "%",     "formula"),
+        ("WACC – CAPM (computed)",        "FORMULA_CAPM_WACC",                                       "%",     "formula"),
+        ("WACC – used (final)",           "FORMULA_WACC_USED",                                       "%",     "formula"),
 
-    rows = [
-        ("Sum of PV of FCFs",      f"=SUM(K3:K{last_data_row})"),
-        ("Terminal FCF (Yr N+1)",  f"={last_fcf_cell}*(1+{TG_CELL})"),
-        # IF TV method = 1 (Exit Multiple): exit_multiple × EBITDA (≈ EBIT × 1.15)
-        # ELSE Gordon Growth: terminal_FCF / (WACC − g)
-        ("Terminal Value",
-            f"=IF({TVMETH_CELL}=1,"
-            f"{EXITMULT_CELL}*{last_ebit_cell}*1.15,"
-            f"B{summary_start+1}/({WACC_CELL}-{TG_CELL}))"),
-        ("PV of Terminal Value",
-            f"=B{summary_start+2}/(1+{WACC_CELL})^({years}-0.5*{MIDYR_CELL})"),
-        ("Enterprise Value",       f"=B{summary_start}+B{summary_start+3}"),
-        ("(−) Total Debt",         f"=-{DEBT_CELL}"),
-        ("(+) Cash & Equivalents", f"={CASH_CELL}"),
-        ("Equity Value",           f"=B{summary_start+4}+B{summary_start+5}+B{summary_start+6}"),
-        ("Shares Outstanding (M)", f"={SHARES_CELL}"),
-        ("DCF Intrinsic Value",    f"=B{summary_start+7}/B{summary_start+8}"),
-        ("Current Market Price",   f"={PRICE_CELL}"),
-        ("Upside / (Downside)",    f"=B{summary_start+9}/B{summary_start+10}-1"),
+        ("__SECTION__", "Terminal & Discounting", None, None),
+        ("Terminal Growth Rate",          term_g,                                                    "%",     "input"),
+        ("Forecast Years",                years,                                                     "",      "input"),
+        ("Mid-year discounting",          "On" if st.session_state.mid_year else "Off",              "",      "dropdown_midyr"),
+        ("TV method",                     st.session_state.tv_method,                                "",      "dropdown_tv"),
+        ("Exit EV/EBITDA Multiple",       st.session_state.exit_multiple,                            "x",     "input"),
+
+        ("__SECTION__", "Capital Structure", None, None),
+        ("Total Debt",                    debt,                                                      "$M",    "input"),
+        ("Cash & Equivalents",            cash,                                                      "$M",    "input"),
+        ("Shares Outstanding",            shares,                                                    "M",     "input"),
+
+        ("__SECTION__", "Market Reference", None, None),
+        ("Current Stock Price",           price,                                                     "$",     "input"),
     ]
-    for i, (label, formula) in enumerate(rows):
-        r = summary_start + i
-        ws2.cell(row=r, column=1, value=label).font = bold
-        c = ws2.cell(row=r, column=2, value=formula)
-        if "Upside" in label:
-            c.number_format = "0.00%"
-        elif "Intrinsic" in label or "Price" in label:
-            c.number_format = "$#,##0.00"
+
+    # Header row
+    ws["A4"] = "Input"; ws["B4"] = "Value"; ws["C4"] = "Unit"
+    for c in ["A4", "B4", "C4"]:
+        ws[c].font = header_font_w; ws[c].fill = section_fill
+        ws[c].alignment = center; ws[c].border = box_border
+    ws.row_dimensions[4].height = 22
+
+    pct_labels = {"Tax Rate", "Reinvestment Rate", "Direct WACC entry", "Terminal Growth Rate",
+                  "ΔNWC (% of Δrevenue)", "Risk-free Rate (Rf)", "Equity Risk Premium (ERP)",
+                  "Pre-tax Cost of Debt (Rd)", "Target Debt Weight (D/V)",
+                  "Cost of Equity (computed)", "After-tax Cost of Debt",
+                  "WACC – CAPM (computed)", "WACC – used (final)"}
+    dollar_M_labels = {"Current Revenue", "Total Debt", "Cash & Equivalents"}
+
+    cur_row = 5
+    INPUT_ROW_MAP = {}
+    formula_row_placeholders = {}  # label → row, filled in below
+
+    for entry in inputs:
+        label = entry[0]
+        if label == "__SECTION__":
+            section_label = entry[1]
+            ws.cell(row=cur_row, column=1, value=section_label).font = section_font
+            for c in range(1, 4):
+                ws.cell(row=cur_row, column=c).fill = section_fill
+            ws.cell(row=cur_row, column=1).alignment = Alignment(horizontal="left", vertical="center", indent=1)
+            ws.merge_cells(start_row=cur_row, start_column=1, end_row=cur_row, end_column=3)
+            cur_row += 1
+            continue
+
+        _, val, unit, kind = entry
+        c1 = ws.cell(row=cur_row, column=1, value=label)
+        c1.font = bold_font; c1.alignment = indent; c1.border = box_border
+        c2 = ws.cell(row=cur_row, column=2)
+        c2.alignment = right; c2.border = box_border
+        c3 = ws.cell(row=cur_row, column=3, value=unit)
+        c3.font = italic_font; c3.alignment = center; c3.border = box_border
+
+        if kind == "formula":
+            # Will fill formula AFTER all rows are placed (need other rows' addresses)
+            formula_row_placeholders[label] = cur_row
+            c2.font = bold_font  # computed cells in plain bold
         else:
-            c.number_format = "$#,##0"
-    ws2.cell(row=summary_start + 9, column=1).font = Font(bold=True, color="1F4E79", size=12)
-    ws2.cell(row=summary_start + 9, column=2).font = Font(bold=True, color="1F4E79", size=12)
+            c2.value = val
+            c2.font = input_font  # editable inputs in blue
 
-    ws2.column_dimensions["A"].width = 26
-    for col_letter in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]:
-        ws2.column_dimensions[col_letter].width = 14
+        # Number format
+        if label in pct_labels:
+            c2.number_format = fmt_pct
+        elif label in dollar_M_labels:
+            c2.number_format = fmt_dollar
+        elif label == "Current Stock Price":
+            c2.number_format = fmt_dollar2
+        elif label == "Shares Outstanding":
+            c2.number_format = fmt_int
+        elif label == "Exit EV/EBITDA Multiple":
+            c2.number_format = fmt_x
+        elif label == "Beta (β)":
+            c2.number_format = "0.00"
 
-    # ─── Sensitivity sheet ────────────────────────────────────────────────────
+        INPUT_ROW_MAP[label] = cur_row
+        cur_row += 1
+
+    # ── Build cell references now that we know all rows ─────────────────
+    REV_CELL      = f"Inputs!$B${INPUT_ROW_MAP['Current Revenue']}"
+    TAX_CELL      = f"Inputs!$B${INPUT_ROW_MAP['Tax Rate']}"
+    REINV_CELL    = f"Inputs!$B${INPUT_ROW_MAP['Reinvestment Rate']}"
+    NWC_CELL      = f"Inputs!$B${INPUT_ROW_MAP['ΔNWC (% of Δrevenue)']}"
+    WACC_MODE_CELL = f"Inputs!$B${INPUT_ROW_MAP['WACC mode']}"
+    DIRECT_WACC_CELL = f"Inputs!$B${INPUT_ROW_MAP['Direct WACC entry']}"
+    RF_CELL       = f"Inputs!$B${INPUT_ROW_MAP['Risk-free Rate (Rf)']}"
+    BETA_CELL     = f"Inputs!$B${INPUT_ROW_MAP['Beta (β)']}"
+    ERP_CELL      = f"Inputs!$B${INPUT_ROW_MAP['Equity Risk Premium (ERP)']}"
+    RD_CELL       = f"Inputs!$B${INPUT_ROW_MAP['Pre-tax Cost of Debt (Rd)']}"
+    DV_CELL       = f"Inputs!$B${INPUT_ROW_MAP['Target Debt Weight (D/V)']}"
+    RE_CELL       = f"Inputs!$B${INPUT_ROW_MAP['Cost of Equity (computed)']}"
+    ATRD_CELL     = f"Inputs!$B${INPUT_ROW_MAP['After-tax Cost of Debt']}"
+    CAPM_WACC_CELL= f"Inputs!$B${INPUT_ROW_MAP['WACC – CAPM (computed)']}"
+    WACC_CELL     = f"Inputs!$B${INPUT_ROW_MAP['WACC – used (final)']}"
+    TG_CELL       = f"Inputs!$B${INPUT_ROW_MAP['Terminal Growth Rate']}"
+    DEBT_CELL     = f"Inputs!$B${INPUT_ROW_MAP['Total Debt']}"
+    CASH_CELL     = f"Inputs!$B${INPUT_ROW_MAP['Cash & Equivalents']}"
+    SHARES_CELL   = f"Inputs!$B${INPUT_ROW_MAP['Shares Outstanding']}"
+    PRICE_CELL    = f"Inputs!$B${INPUT_ROW_MAP['Current Stock Price']}"
+    MIDYR_CELL    = f"Inputs!$B${INPUT_ROW_MAP['Mid-year discounting']}"
+    TVMETH_CELL   = f"Inputs!$B${INPUT_ROW_MAP['TV method']}"
+    EXITMULT_CELL = f"Inputs!$B${INPUT_ROW_MAP['Exit EV/EBITDA Multiple']}"
+
+    # Now fill the formula cells
+    re_strip = lambda s: s.replace("Inputs!", "").replace("$", "")
+    ws.cell(row=formula_row_placeholders['Cost of Equity (computed)'], column=2,
+        value=f"={re_strip(RF_CELL)}+{re_strip(BETA_CELL)}*{re_strip(ERP_CELL)}")
+    ws.cell(row=formula_row_placeholders['After-tax Cost of Debt'], column=2,
+        value=f"={re_strip(RD_CELL)}*(1-{re_strip(TAX_CELL)})")
+    ws.cell(row=formula_row_placeholders['WACC – CAPM (computed)'], column=2,
+        value=f"=(1-{re_strip(DV_CELL)})*{re_strip(RE_CELL)}+{re_strip(DV_CELL)}*{re_strip(ATRD_CELL)}")
+    ws.cell(row=formula_row_placeholders['WACC – used (final)'], column=2,
+        value=f'=IF({re_strip(WACC_MODE_CELL)}="Direct",{re_strip(DIRECT_WACC_CELL)},{re_strip(CAPM_WACC_CELL)})')
+    # Mark the WACC-used row as the highlight summary
+    final_wacc_row = INPUT_ROW_MAP['WACC – used (final)']
+    ws.cell(row=final_wacc_row, column=1).fill = summary_fill
+    ws.cell(row=final_wacc_row, column=2).fill = summary_fill
+    ws.cell(row=final_wacc_row, column=1).font = summary_font
+    ws.cell(row=final_wacc_row, column=2).font = summary_font
+
+    # ── Data validation dropdowns ────────────────────────────────────────
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    dv_wacc = DataValidation(type="list", formula1='"Direct,CAPM build-up"', allow_blank=False)
+    dv_wacc.add(f"B{INPUT_ROW_MAP['WACC mode']}")
+    ws.add_data_validation(dv_wacc)
+
+    dv_midyr = DataValidation(type="list", formula1='"On,Off"', allow_blank=False)
+    dv_midyr.add(f"B{INPUT_ROW_MAP['Mid-year discounting']}")
+    ws.add_data_validation(dv_midyr)
+
+    dv_tv = DataValidation(type="list", formula1='"Gordon Growth,Exit Multiple"', allow_blank=False)
+    dv_tv.add(f"B{INPUT_ROW_MAP['TV method']}")
+    ws.add_data_validation(dv_tv)
+
+    # Per-year growth + margin path table
+    spacer = cur_row + 1
+    ws.cell(row=spacer, column=1, value="Per-Year Growth & Margin Path").font = subtitle_font
+    spacer += 1
+    ws.cell(row=spacer, column=1, value="Year").font = header_font_w
+    ws.cell(row=spacer, column=2, value="Growth Rate").font = header_font_w
+    ws.cell(row=spacer, column=3, value="EBIT Margin").font = header_font_w
+    for c in range(1, 4):
+        ws.cell(row=spacer, column=c).fill = section_fill
+        ws.cell(row=spacer, column=c).alignment = center
+        ws.cell(row=spacer, column=c).border = box_border
+    PATH_FIRST_ROW = spacer + 1
+    for t in range(years):
+        r = PATH_FIRST_ROW + t
+        c1 = ws.cell(row=r, column=1, value=f"Year {t+1}")
+        c1.font = bold_font; c1.alignment = center; c1.border = box_border
+        c2 = ws.cell(row=r, column=2, value=growth_path[t])
+        c2.font = input_font; c2.alignment = right; c2.border = box_border; c2.number_format = fmt_pct
+        c3 = ws.cell(row=r, column=3, value=margin_path[t])
+        c3.font = input_font; c3.alignment = right; c3.border = box_border; c3.number_format = fmt_pct
+
+    # Column widths + freeze panes
+    ws.column_dimensions["A"].width = 36
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 12
+    ws.freeze_panes = "A5"
+
+    # =====================================================================
+    # SHEET 3 — DCF Model (wide format, banker layout)
+    # =====================================================================
+    wsm = wb.create_sheet("DCF Model")
+    wsm.sheet_properties.tabColor = "70AD47"
+    wsm.sheet_view.showGridLines = False
+
+    # Title
+    wsm.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2 + years)
+    wsm["A1"] = "Discounted Cash Flow Model"
+    wsm["A1"].font = title_font; wsm["A1"].alignment = left
+    wsm.merge_cells(start_row=2, start_column=1, end_row=2, end_column=2 + years)
+    wsm["A2"] = f"{company_name} ({ticker})  ·  {years}-year forecast  ·  All figures in $M unless noted"
+    wsm["A2"].font = italic_font
+
+    # Year header row at row 4
+    wsm.cell(row=4, column=1, value="").fill = section_fill
+    wsm.cell(row=4, column=2, value="Base").font = header_font_w
+    wsm.cell(row=4, column=2).fill = section_fill; wsm.cell(row=4, column=2).alignment = center
+    wsm.cell(row=4, column=2).border = box_border
+    for t in range(1, years + 1):
+        c = wsm.cell(row=4, column=2 + t, value=f"Year {t}")
+        c.font = header_font_w; c.fill = section_fill; c.alignment = center; c.border = box_border
+    wsm.cell(row=4, column=1).border = box_border
+    wsm.row_dimensions[4].height = 22
+
+    # Section: Revenue Build
+    section_bar(wsm, 6, 1, 2 + years, "Revenue Build")
+
+    # Row 7: Revenue (Base + forecast formulas)
+    wsm.cell(row=7, column=1, value="Revenue ($M)").font = bold_font
+    wsm.cell(row=7, column=1).alignment = indent
+    wsm.cell(row=7, column=2, value=f"={REV_CELL}").number_format = fmt_int
+    for t in range(1, years + 1):
+        col = 2 + t
+        prev_col = get_column_letter(col - 1)
+        path_row = PATH_FIRST_ROW + (t - 1)
+        # Revenue grows by per-year growth from the path table on Inputs
+        wsm.cell(row=7, column=col,
+            value=f"={prev_col}7*(1+Inputs!$B${path_row})")
+        wsm.cell(row=7, column=col).number_format = fmt_int
+
+    # Row 8: Growth Rate
+    wsm.cell(row=8, column=1, value="  Growth Rate").font = italic_font
+    wsm.cell(row=8, column=1).alignment = Alignment(horizontal="left", indent=2)
+    wsm.cell(row=8, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t
+        path_row = PATH_FIRST_ROW + (t - 1)
+        wsm.cell(row=8, column=col, value=f"=Inputs!$B${path_row}").number_format = fmt_pct1
+        wsm.cell(row=8, column=col).font = italic_font
+
+    # Row 9: EBIT Margin
+    wsm.cell(row=9, column=1, value="  EBIT Margin").font = italic_font
+    wsm.cell(row=9, column=1).alignment = Alignment(horizontal="left", indent=2)
+    wsm.cell(row=9, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t
+        path_row = PATH_FIRST_ROW + (t - 1)
+        wsm.cell(row=9, column=col, value=f"=Inputs!$C${path_row}").number_format = fmt_pct1
+        wsm.cell(row=9, column=col).font = italic_font
+
+    # Section: Operating Calculation
+    section_bar(wsm, 11, 1, 2 + years, "Operating Profit")
+
+    # Row 12: EBIT
+    wsm.cell(row=12, column=1, value="EBIT ($M)").font = bold_font
+    wsm.cell(row=12, column=1).alignment = indent
+    wsm.cell(row=12, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t
+        col_letter = get_column_letter(col)
+        wsm.cell(row=12, column=col, value=f"={col_letter}7*{col_letter}9").number_format = fmt_int
+
+    # Row 13: NOPAT
+    wsm.cell(row=13, column=1, value="NOPAT ($M)").font = bold_font
+    wsm.cell(row=13, column=1).alignment = indent
+    wsm.cell(row=13, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t
+        col_letter = get_column_letter(col)
+        wsm.cell(row=13, column=col, value=f"={col_letter}12*(1-{TAX_CELL})").number_format = fmt_int
+
+    # Section: Reinvestment & FCF
+    section_bar(wsm, 15, 1, 2 + years, "Free Cash Flow")
+
+    # Row 16: Less: Reinvestment
+    wsm.cell(row=16, column=1, value="(−) Reinvestment").alignment = indent
+    wsm.cell(row=16, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t; col_letter = get_column_letter(col)
+        wsm.cell(row=16, column=col, value=f"=-{col_letter}13*{REINV_CELL}").number_format = fmt_int
+
+    # Row 17: Less: ΔNWC
+    wsm.cell(row=17, column=1, value="(−) ΔNWC").alignment = indent
+    wsm.cell(row=17, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t; col_letter = get_column_letter(col); prev_col = get_column_letter(col - 1)
+        wsm.cell(row=17, column=col,
+            value=f"=-MAX(0,({col_letter}7-{prev_col}7)*{NWC_CELL})").number_format = fmt_int
+
+    # Row 18: FCF (highlighted)
+    wsm.cell(row=18, column=1, value="Free Cash Flow ($M)").font = summary_font
+    wsm.cell(row=18, column=1).fill = summary_fill
+    wsm.cell(row=18, column=1).alignment = indent
+    wsm.cell(row=18, column=1).border = Border(top=thick, bottom=thick, left=thin, right=thin)
+    wsm.cell(row=18, column=2, value="—").alignment = center
+    wsm.cell(row=18, column=2).fill = summary_fill
+    wsm.cell(row=18, column=2).border = Border(top=thick, bottom=thick, left=thin, right=thin)
+    for t in range(1, years + 1):
+        col = 2 + t; col_letter = get_column_letter(col)
+        c = wsm.cell(row=18, column=col, value=f"={col_letter}13+{col_letter}16+{col_letter}17")
+        c.font = summary_font; c.fill = summary_fill; c.number_format = fmt_int
+        c.border = Border(top=thick, bottom=thick, left=thin, right=thin)
+
+    # Section: Discounting
+    section_bar(wsm, 20, 1, 2 + years, "Discounting")
+
+    # Row 21: Discount Factor
+    wsm.cell(row=21, column=1, value="Discount Factor").alignment = indent
+    wsm.cell(row=21, column=2, value="—").alignment = center
+    # Mid-year toggle is text "On"/"Off" — convert to 1/0 inline
+    midyr_flag = f'(IF({MIDYR_CELL}="On",1,0))'
+    for t in range(1, years + 1):
+        col = 2 + t
+        wsm.cell(row=21, column=col,
+            value=f"=1/(1+{WACC_CELL})^({t}-0.5*{midyr_flag})").number_format = fmt_factor
+
+    # Row 22: PV of FCF
+    wsm.cell(row=22, column=1, value="PV of FCF ($M)").font = bold_font
+    wsm.cell(row=22, column=1).alignment = indent
+    wsm.cell(row=22, column=2, value="—").alignment = center
+    for t in range(1, years + 1):
+        col = 2 + t; col_letter = get_column_letter(col)
+        wsm.cell(row=22, column=col, value=f"={col_letter}18*{col_letter}21").number_format = fmt_int
+
+    # ── Valuation summary panel (Years cols B onward) ────────────────────
+    section_bar(wsm, 24, 1, 2 + years, "Valuation Summary")
+    last_year_col_letter = get_column_letter(2 + years)
+    pv_first_col = get_column_letter(3)
+    pv_last_col  = get_column_letter(2 + years)
+
+    summary_rows = [
+        ("Sum of PV of FCFs",
+            f"=SUM({pv_first_col}22:{pv_last_col}22)", fmt_dollar),
+        ("Terminal FCF (Year N+1)",
+            f"={last_year_col_letter}18*(1+{TG_CELL})", fmt_dollar),
+        ("Terminal Value",
+            f'=IF({TVMETH_CELL}="Exit Multiple",'
+            f"{EXITMULT_CELL}*{last_year_col_letter}12*1.15,"
+            f"B26/({WACC_CELL}-{TG_CELL}))", fmt_dollar),
+        ("PV of Terminal Value",
+            f"=B27/(1+{WACC_CELL})^({years}-0.5*{midyr_flag})", fmt_dollar),
+        ("Enterprise Value",
+            f"=B25+B28", fmt_dollar),
+        ("(−) Total Debt",
+            f"=-{DEBT_CELL}", fmt_dollar),
+        ("(+) Cash & Equivalents",
+            f"={CASH_CELL}", fmt_dollar),
+        ("Equity Value",
+            f"=B29+B30+B31", fmt_dollar),
+        ("Shares Outstanding (M)",
+            f"={SHARES_CELL}", fmt_int),
+        ("DCF Intrinsic Value per Share",
+            f"=B32/B33", fmt_dollar2),
+        ("Current Market Price",
+            f"={PRICE_CELL}", fmt_dollar2),
+        ("Upside / (Downside)",
+            f"=B34/B35-1", fmt_pct),
+    ]
+    for i, (label, formula, fmt) in enumerate(summary_rows):
+        r = 25 + i
+        c1 = wsm.cell(row=r, column=1, value=label)
+        c1.font = bold_font; c1.alignment = indent; c1.border = box_border
+        c2 = wsm.cell(row=r, column=2, value=formula)
+        c2.alignment = right; c2.border = box_border; c2.number_format = fmt
+        # Highlight the headline intrinsic-value row
+        if "Intrinsic Value" in label:
+            c1.font = summary_font; c1.fill = summary_fill
+            c2.font = summary_font; c2.fill = summary_fill
+            c2.border = Border(top=thick, bottom=thick, left=thin, right=thin)
+            c1.border = Border(top=thick, bottom=thick, left=thin, right=thin)
+
+    # Column widths + freeze panes
+    wsm.column_dimensions["A"].width = 32
+    for t in range(years + 1):
+        wsm.column_dimensions[get_column_letter(2 + t)].width = 14
+    wsm.freeze_panes = "B5"
+
+    # Now finalize the Summary sheet headline formulas (we know intrinsic is at DCF Model B34)
+    ws1.cell(row=8, column=3, value="='DCF Model'!$B$34")           # Intrinsic
+    ws1.cell(row=9, column=3, value=f"={PRICE_CELL}")               # Market price
+    ws1.cell(row=10, column=3, value="='DCF Model'!$B$34/$C$9-1")   # Upside
+    ws1.cell(row=11, column=3, value="=($C$8-$C$9)/$C$8")           # Margin of safety
+
+    # =====================================================================
+    # SHEET 4 — Sensitivity (with conditional formatting)
+    # =====================================================================
     ws3 = wb.create_sheet("Sensitivity")
-    ws3["A1"] = "Sensitivity: WACC vs. Terminal Growth (Intrinsic Value per Share)"
-    ws3["A1"].font = Font(bold=True, size=12)
+    ws3.sheet_properties.tabColor = "FFC000"
+    ws3.sheet_view.showGridLines = False
 
-    ws3["A3"] = "WACC ↓ / g →"
-    ws3["A3"].font = bold; ws3["A3"].fill = header_fill; ws3["A3"].font = header_font
+    ws3.merge_cells("A1:G1"); ws3["A1"] = "Sensitivity Analysis"
+    ws3["A1"].font = title_font; ws3["A1"].alignment = left
+    ws3.merge_cells("A2:G2")
+    ws3["A2"] = "Intrinsic Value per Share ($) — WACC vs. Terminal Growth Rate"
+    ws3["A2"].font = italic_font
+
+    # Header row
+    hdr_row = 4
+    c = ws3.cell(row=hdr_row, column=1, value="WACC ↓ / g →")
+    c.font = header_font_w; c.fill = section_fill; c.alignment = center; c.border = box_border
     for j, tg_val in enumerate(tg_range):
-        c = ws3.cell(row=3, column=2 + j, value=tg_val)
-        c.number_format = "0.00%"; c.font = header_font; c.fill = header_fill
-    for i, w_val in enumerate(wacc_range):
-        if w_val <= 0: continue
-        c = ws3.cell(row=4 + i, column=1, value=w_val)
-        c.number_format = "0.00%"; c.font = bold
+        c = ws3.cell(row=hdr_row, column=2 + j, value=tg_val)
+        c.font = header_font_w; c.fill = section_fill; c.alignment = center
+        c.border = box_border; c.number_format = fmt_pct
+    ws3.row_dimensions[hdr_row].height = 22
 
-    # The actual values (not formulas — would explode the workbook size)
-    for i, w_val in enumerate(wacc_range):
-        if w_val <= 0: continue
+    valid_wacc = [w for w in wacc_range if w > 0]
+    for i, w_val in enumerate(valid_wacc):
+        r = hdr_row + 1 + i
+        c = ws3.cell(row=r, column=1, value=w_val)
+        c.font = header_font_w; c.fill = section_fill; c.alignment = center
+        c.border = box_border; c.number_format = fmt_pct
         for j, tg_val in enumerate(tg_range):
+            cell = ws3.cell(row=r, column=2 + j)
+            cell.alignment = right; cell.border = box_border
             if tg_val < 0 or w_val <= tg_val:
-                ws3.cell(row=4 + i, column=2 + j, value="N/A")
+                cell.value = "N/A"; cell.alignment = center
+                cell.font = italic_font
                 continue
             dd = _sens_dcf(w=w_val, tg=tg_val)
             eq = dd["enterprise_value"] - debt + cash
-            ws3.cell(row=4 + i, column=2 + j, value=eq / shares).number_format = "$#,##0.00"
+            cell.value = eq / shares; cell.number_format = fmt_dollar2
+
+    # Conditional formatting: red→yellow→green color scale on the data cells
+    last_row = hdr_row + len(valid_wacc)
+    last_col = get_column_letter(1 + len(tg_range))
+    data_range = f"B{hdr_row+1}:{last_col}{last_row}"
+    ws3.conditional_formatting.add(
+        data_range,
+        ColorScaleRule(start_type="min", start_color="F8696B",
+                       mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                       end_type="max", end_color="63BE7B")
+    )
 
     ws3.column_dimensions["A"].width = 16
     for j in range(len(tg_range)):
-        ws3.column_dimensions[chr(ord("B") + j)].width = 14
+        ws3.column_dimensions[get_column_letter(2 + j)].width = 14
+    ws3.freeze_panes = "B5"
 
-    # ─── README / methodology sheet ──────────────────────────────────────────
+    # =====================================================================
+    # SHEET 5 — Methodology
+    # =====================================================================
     ws4 = wb.create_sheet("Methodology")
-    notes = [
-        "DCF Equity Valuation — Excel Replication",
-        "",
-        f"Company: {company_name} ({ticker})",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "",
-        "Sheets:",
-        "  1. Inputs — all assumptions + per-year growth/margin path (editable)",
-        "  2. DCF Projection — year-by-year forecast + valuation summary (live formulas)",
-        "  3. Sensitivity — WACC × Terminal growth grid (computed values)",
-        "",
-        "Active modeling settings (snapshot from app — see 'Modeling notes' on Inputs sheet):",
-        f"  • Growth path:    {st.session_state.growth_mode}",
-        f"  • Margin path:    {st.session_state.margin_mode}",
-        f"  • WACC mode:      {st.session_state.wacc_mode} (resolved to {wacc*100:.2f}%)",
-        f"  • Terminal value: {st.session_state.tv_method}",
-        f"  • Discounting:    {'Mid-year' if st.session_state.mid_year else 'End-of-year'}",
-        f"  • ΔNWC drag:      {st.session_state.nwc_pct:.1f}% of revenue change",
-        "",
-        "How to use:",
-        "  • Edit any cell in 'Inputs' — the DCF Projection sheet recomputes automatically.",
-        "  • Per-year growth/margin in the Inputs sheet (rows 20+) are the actual rates the model used,",
-        "    derived from your modeling-mode choice. Override any year independently to stress-test.",
-        "  • Compare 'DCF Intrinsic Value' to 'Current Market Price' on the projection sheet.",
-        "  • Sensitivity sheet shows how valuation moves with WACC × terminal-growth.",
-        "",
-        "Data source: SEC EDGAR 10-K filings (when 'Auto-fill from EDGAR' was used in the app).",
+    ws4.sheet_properties.tabColor = "A6A6A6"
+    ws4.sheet_view.showGridLines = False
+
+    ws4.merge_cells("A1:E1"); ws4["A1"] = "Methodology"
+    ws4["A1"].font = title_font; ws4["A1"].alignment = left
+
+    sections = [
+        ("Workbook Contents", [
+            "Summary       — Headline metrics, key assumptions, modeling settings",
+            "Inputs        — All editable assumptions + per-year growth/margin path",
+            "DCF Model     — Year-by-year forecast, FCF buildup, valuation summary (live formulas)",
+            "Sensitivity   — WACC × Terminal Growth grid with red/yellow/green color scale",
+            "Methodology   — This page",
+        ]),
+        ("How to Use", [
+            "Edit any blue-font cell on the Inputs sheet — the entire model recomputes.",
+            "The 'Per-Year Growth & Margin Path' table on Inputs is the actual rates used.",
+            "  Override any single year independently to stress-test scenarios.",
+            "Compare 'DCF Intrinsic Value per Share' to 'Current Market Price' on the DCF Model sheet.",
+            "Sensitivity sheet shows valuation under different WACC × terminal-growth combinations.",
+        ]),
+        ("DCF Methodology", [
+            "1. Forecast revenue, EBIT, NOPAT, and free cash flow for the explicit forecast period.",
+            "2. Discount each year's FCF to present value using 1 / (1+WACC)^t.",
+            "   (Mid-year convention uses (t − 0.5) instead of t.)",
+            "3. Terminal Value:",
+            "   • Gordon Growth: FCF_N × (1+g) / (WACC − g)",
+            "   • Exit Multiple: EV/EBITDA × terminal-year EBITDA (≈ EBIT × 1.15)",
+            "4. Enterprise Value = Σ PV of FCFs + PV of Terminal Value",
+            "5. Equity Value = EV − Total Debt + Cash & Equivalents",
+            "6. Intrinsic Value per Share = Equity Value ÷ Diluted Shares Outstanding",
+        ]),
+        ("Active Settings (snapshot)", [
+            f"Growth path:         {st.session_state.growth_mode}",
+            f"Margin path:         {st.session_state.margin_mode}",
+            f"WACC mode:           {st.session_state.wacc_mode}  (resolved to {wacc*100:.2f}%)",
+            f"Terminal value:      {st.session_state.tv_method}",
+            f"Discounting:         {'Mid-year' if st.session_state.mid_year else 'End-of-year'}",
+            f"ΔNWC drag:           {st.session_state.nwc_pct:.1f}% of revenue change",
+        ]),
+        ("Data Source", [
+            "SEC EDGAR Company Facts API (data.sec.gov) — when 'Auto-fill from EDGAR' was used in the app.",
+            "All inputs remain user-editable. No third-party API dependencies at runtime.",
+        ]),
     ]
-    for i, line in enumerate(notes, start=1):
-        c = ws4.cell(row=i, column=1, value=line)
-        if i == 1: c.font = Font(bold=True, size=14, color="1F4E79")
-        elif line.endswith(":"): c.font = bold
-    ws4.column_dimensions["A"].width = 90
+
+    cur = 3
+    for header, lines in sections:
+        c = ws4.cell(row=cur, column=1, value=header)
+        c.font = section_font; c.fill = section_fill
+        c.alignment = Alignment(horizontal="left", indent=1)
+        ws4.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=5)
+        cur += 1
+        for line in lines:
+            c = ws4.cell(row=cur, column=1, value=line)
+            c.font = base_font
+            c.alignment = Alignment(horizontal="left", indent=2)
+            ws4.merge_cells(start_row=cur, start_column=1, end_row=cur, end_column=5)
+            cur += 1
+        cur += 1  # blank spacer between sections
+
+    ws4.column_dimensions["A"].width = 100
+    for col in ["B", "C", "D", "E"]:
+        ws4.column_dimensions[col].width = 10
 
     return wb
 
