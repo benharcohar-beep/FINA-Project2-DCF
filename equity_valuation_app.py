@@ -1,15 +1,9 @@
 # =============================================================================
-# FINA 4011/5011 — Project 2: DCF Equity Valuation App
+# DCF Equity Valuation — Streamlit App
 # =============================================================================
-# A Streamlit app that values a stock via Discounted Cash Flow (DCF).
-#
-# Design principles:
-#   - Manual inputs are the source of truth (always editable, never overwritten silently).
-#   - Optional one-click "Auto-fill from SEC EDGAR" pulls real 10-K fundamentals.
-#   - No real-time Yahoo Finance calls (avoids rate-limit failures).
-#   - Every computation is shown step-by-step with formulas.
-#   - Sensitivity tables on two key drivers.
-#   - Excel export creates a workbook with REAL formulas matching the app's math.
+# Discounted Cash Flow valuation tool with optional SEC EDGAR auto-fill,
+# CAPM-based WACC build-up, multi-stage growth, margin expansion path,
+# sensitivity tables, and Excel export with live formulas.
 #
 # Run locally:
 #   pip install -r requirements.txt
@@ -32,15 +26,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("📊 DCF Equity Valuation App")
-st.caption("FINA 4011/5011 · Project 2 · Discounted Cash Flow Valuation Tool")
+st.title("📊 DCF Equity Valuation")
+st.caption("Discounted Cash Flow valuation tool with SEC filings auto-fill and Excel export")
 
 # =============================================================================
 # SEC EDGAR — optional auto-fill helpers
 # Uses the official SEC API: free, no key, not rate-limited beyond UA requirement.
 # =============================================================================
 _SEC_HEADERS = {
-    "User-Agent": "FINA4011-DCF-App academic-project@university.edu",
+    "User-Agent": "DCF-Valuation-App contact@dcf-app.local",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -255,8 +249,30 @@ DEFAULTS = {
     "shares":          15300.0,    # millions
     "current_price":   210.00,     # $
     "edgar_data":      None,
-    "loaded_ticker":   "AAPL",     # which ticker the loaded data corresponds to
-    "edgar_msg":       None,       # ("success"|"warning"|"error", text) from last fetch
+    "loaded_ticker":   "AAPL",
+    "edgar_msg":       None,
+    # ── Advanced modeling toggles ────────────────────────────────────────
+    "wacc_mode":       "Direct",   # "Direct" | "CAPM build-up"
+    "rf":              4.00,       # Risk-free rate (10-yr Treasury), %
+    "erp":             5.50,       # Equity risk premium, %
+    "beta":            1.00,       # Levered beta
+    "rd_pretax":       5.00,       # Pre-tax cost of debt, %
+    "weight_debt":     20.0,       # Target debt weight, % (rest = equity)
+    "growth_mode":     "Constant", # "Constant" | "3-stage (high → fade → terminal)"
+    "high_growth":     15.0,
+    "high_years":      3,
+    "fade_years":      4,
+    "margin_mode":     "Constant", # "Constant" | "Linear expansion"
+    "margin_terminal": 30.0,
+    # Terminal value method
+    "tv_method":       "Gordon Growth", # "Gordon Growth" | "Exit Multiple"
+    "exit_multiple":   12.0,       # EV / EBITDA at year N
+    # Discounting convention
+    "mid_year":        False,      # mid-year convention (more accurate)
+    # Verdict thresholds
+    "fair_band":       10.0,       # % band around price that counts as "fairly valued"
+    # Working capital change as a separate driver
+    "nwc_pct":         2.0,        # change in NWC as % of revenue (deducted from FCF)
 }
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
@@ -383,27 +399,113 @@ with st.sidebar:
     st.subheader("💰 Financial Inputs")
     st.caption("All dollar values in millions ($M)")
 
+    # Dollar amounts stay as number_input — sliders are too imprecise for $100B+
     st.number_input("Current Revenue ($M)", min_value=0.0, step=100.0, key="revenue",
                     help="Most recent annual revenue. EDGAR fills with latest 10-K value.")
-    st.number_input("EBIT Margin (%)", min_value=0.0, max_value=100.0, step=0.5, key="margin",
-                    help="Operating Income ÷ Revenue. Higher margin → more value. EDGAR computes from 10-K.")
-    st.number_input("Tax Rate (%)", min_value=0.0, max_value=50.0, step=0.5, key="tax_rate",
-                    help="Effective corporate tax rate. US federal statutory is 21%; effective often 15-25%.")
-    st.number_input("Reinvestment Rate (%)", min_value=0.0, max_value=100.0, step=1.0, key="reinvest_rate",
-                    help="% of NOPAT reinvested in CapEx + working capital. Higher → less FCF today, more growth.")
+
+    # ── Margin: simple slider, with optional linear-expansion mode ──
+    st.radio("Margin assumption", options=["Constant", "Linear expansion"],
+             key="margin_mode", horizontal=True,
+             help="Constant = flat EBIT margin every year. Linear expansion = margin moves linearly from Year 1 to Year N (good for growth firms with operating leverage).")
+    st.slider("EBIT Margin (Year 1) (%)", min_value=0.0, max_value=100.0, step=0.5, key="margin",
+              format="%.1f%%",
+              help="Operating Income ÷ Revenue. Higher margin → more value. EDGAR auto-fills from 10-K.")
+    if st.session_state.margin_mode == "Linear expansion":
+        st.slider("Terminal EBIT Margin (Year N) (%)", min_value=0.0, max_value=100.0, step=0.5,
+                  key="margin_terminal", format="%.1f%%",
+                  help="Margin in the final forecast year. Linear interpolation between Year 1 and Year N.")
+
+    st.slider("Tax Rate (%)", min_value=0.0, max_value=50.0, step=0.5, key="tax_rate",
+              format="%.1f%%",
+              help="Effective corporate tax rate. US federal statutory is 21%; effective often 15-25%.")
+    st.slider("Reinvestment Rate (%)", min_value=0.0, max_value=100.0, step=1.0, key="reinvest_rate",
+              format="%.0f%%",
+              help="% of NOPAT reinvested in CapEx + working capital. Higher → less FCF today, more future growth.")
+
+    st.slider("Δ Working Capital (% of Δ Revenue)", min_value=0.0, max_value=30.0, step=0.5,
+              key="nwc_pct", format="%.1f%%",
+              help="Net working capital tied up per dollar of revenue growth. Subtracted from FCF. Typical 1-5%.")
 
     st.markdown("---")
 
-    # ─── Growth + WACC ───────────────────────────────────────────────────────
-    st.subheader("📈 Growth & Discount Rate")
-    st.number_input("Annual Growth Rate (%)", min_value=-20.0, max_value=50.0, step=0.5, key="growth",
-                    help="Revenue growth during forecast period. EDGAR fills with 3-yr CAGR.")
-    st.number_input("WACC — Discount Rate (%)", min_value=1.0, max_value=30.0, step=0.25, key="wacc",
-                    help="Weighted Average Cost of Capital. Mature firms: 7-10%. Riskier: 10-15%.")
-    st.number_input("Terminal Growth Rate (%)", min_value=0.0, max_value=10.0, step=0.25, key="terminal_growth",
-                    help="Perpetual growth after forecast. Cap at long-run GDP growth (~2-3%).")
-    st.slider("Forecast Years", min_value=3, max_value=10, key="years",
-              help="Length of explicit forecast. Standard is 5-10 years.")
+    # ─── Growth ──────────────────────────────────────────────────────────────
+    st.subheader("📈 Growth")
+    st.radio("Growth path", options=["Constant", "3-stage (high → fade → terminal)"],
+             key="growth_mode", horizontal=False,
+             help="Constant = same growth rate every year. 3-stage = high-growth period, then linear fade, then stable terminal.")
+
+    if st.session_state.growth_mode == "Constant":
+        st.slider("Annual Growth Rate (%)", min_value=-20.0, max_value=50.0, step=0.5, key="growth",
+                  format="%.1f%%",
+                  help="Revenue growth during the forecast period. EDGAR fills with 3-yr CAGR.")
+    else:
+        st.slider("High-growth Rate (%)", min_value=-10.0, max_value=80.0, step=0.5,
+                  key="high_growth", format="%.1f%%",
+                  help="Growth rate during the high-growth phase. Often 10-25% for growth companies.")
+        st.slider("High-growth Years", min_value=1, max_value=10,
+                  key="high_years",
+                  help="Number of years at the high-growth rate before fading begins.")
+        st.slider("Fade-down Years", min_value=1, max_value=10,
+                  key="fade_years",
+                  help="Number of years over which growth linearly fades from high-growth rate to terminal rate.")
+        # In 3-stage mode, the simple `growth` slider is unused — show it disabled for transparency
+        st.caption("(The simple 'Annual Growth Rate' slider is ignored in 3-stage mode.)")
+
+    st.slider("Terminal Growth Rate (%)", min_value=0.0, max_value=10.0, step=0.25,
+              key="terminal_growth", format="%.2f%%",
+              help="Perpetual growth after the forecast period. Cap at long-run GDP growth (~2-3%).")
+
+    st.slider("Forecast Years", min_value=3, max_value=15, key="years",
+              help="Length of the explicit forecast. Standard is 5-10 years.")
+
+    # ── Terminal Value method ──
+    st.radio("Terminal Value method", options=["Gordon Growth", "Exit Multiple"],
+             key="tv_method", horizontal=True,
+             help="Gordon Growth = perpetuity formula using terminal growth rate. Exit Multiple = EV/EBITDA × terminal-year EBITDA (assumes the firm is sold at year N).")
+    if st.session_state.tv_method == "Exit Multiple":
+        st.slider("Exit EV/EBITDA Multiple", min_value=2.0, max_value=40.0, step=0.5,
+                  key="exit_multiple", format="%.1fx",
+                  help="EV / EBITDA multiple at exit. Mature: 8-12x. Growth: 15-25x. Premium tech: 25x+.")
+
+    st.markdown("---")
+
+    # ─── WACC: direct or CAPM build-up ───────────────────────────────────────
+    st.subheader("💸 Discount Rate (WACC)")
+    st.radio("WACC mode", options=["Direct", "CAPM build-up"],
+             key="wacc_mode", horizontal=True,
+             help="Direct = enter WACC directly. CAPM build-up = compute WACC from risk-free rate, beta, equity risk premium, cost of debt, and capital structure (textbook formula).")
+
+    if st.session_state.wacc_mode == "Direct":
+        st.slider("WACC (%)", min_value=1.0, max_value=30.0, step=0.25, key="wacc",
+                  format="%.2f%%",
+                  help="Weighted Average Cost of Capital. Mature firms: 7-10%. Riskier: 10-15%.")
+    else:
+        st.slider("Risk-free Rate Rf (%)", min_value=0.0, max_value=10.0, step=0.05,
+                  key="rf", format="%.2f%%",
+                  help="10-year US Treasury yield. As of 2025, ~4.0-4.5%.")
+        st.slider("Equity Risk Premium ERP (%)", min_value=2.0, max_value=12.0, step=0.1,
+                  key="erp", format="%.2f%%",
+                  help="Excess return required over the risk-free rate for holding stocks. US historical ~5-6%.")
+        st.slider("Beta (β)", min_value=0.0, max_value=3.0, step=0.05, key="beta",
+                  help="Stock's sensitivity to market moves. 1.0 = market average. Tech > 1, utilities < 1.")
+        st.slider("Pre-tax Cost of Debt Rd (%)", min_value=0.0, max_value=15.0, step=0.1,
+                  key="rd_pretax", format="%.2f%%",
+                  help="Yield on the company's debt. Investment-grade typically 4-6%, high-yield 6-10%.")
+        st.slider("Target Debt Weight (D/V) (%)", min_value=0.0, max_value=80.0, step=1.0,
+                  key="weight_debt", format="%.0f%%",
+                  help="Debt as % of total capital. Equity weight = 100% − Debt weight.")
+
+    st.markdown("---")
+
+    # ─── Advanced settings ───────────────────────────────────────────────────
+    with st.expander("🔧 Advanced settings"):
+        st.checkbox("Mid-year discounting convention", key="mid_year",
+                    help="Standard practice in banking: assumes cash flows arrive mid-year, "
+                         "discounted with exponent (t − 0.5) instead of t. Yields ~half-year-of-WACC higher valuation.")
+        st.slider("Verdict threshold — 'Fairly Valued' band (±%)", min_value=2.0, max_value=25.0,
+                  step=1.0, key="fair_band", format="%.0f%%",
+                  help="If intrinsic value is within ±this band of market price, verdict says 'Fairly Valued'. "
+                       "Outside the band: 'Undervalued' or 'Overvalued'.")
 
     st.markdown("---")
 
@@ -434,7 +536,6 @@ growth        = float(st.session_state.growth) / 100
 margin        = float(st.session_state.margin) / 100
 tax_rate      = float(st.session_state.tax_rate) / 100
 reinvest_rate = float(st.session_state.reinvest_rate) / 100
-wacc          = float(st.session_state.wacc) / 100
 term_g        = float(st.session_state.terminal_growth) / 100
 years         = int(st.session_state.years)
 debt          = float(st.session_state.debt)
@@ -442,7 +543,151 @@ cash          = float(st.session_state.cash)
 shares        = max(float(st.session_state.shares), 0.1)  # never zero (divide guard)
 price         = max(float(st.session_state.current_price), 0.01)
 
-# Validate inputs and surface clear errors before doing math.
+# Resolve WACC (direct entry OR CAPM build-up) BEFORE validation
+cost_equity = after_tax_rd = None
+if st.session_state.wacc_mode == "CAPM build-up":
+    wacc, cost_equity, after_tax_rd = None, None, None  # filled below
+else:
+    wacc = float(st.session_state.wacc) / 100
+
+
+# =============================================================================
+# DCF Calculation — accepts per-year growth/margin paths for multi-stage models
+# =============================================================================
+def build_growth_path(simple_g, n, mode, hg_rate, hg_years, fade_years, term_g):
+    """Generate a per-year growth-rate list.
+    Modes:
+      "Constant": flat g for all forecast years.
+      "3-stage": high-growth period at hg_rate, then linear fade over fade_years
+                 down to term_g, then term_g for any remaining years.
+    """
+    if mode != "3-stage (high → fade → terminal)":
+        return [simple_g] * n
+    path = []
+    hg_yrs    = max(0, int(hg_years))
+    fade_yrs  = max(1, int(fade_years))
+    for t in range(1, n + 1):
+        if t <= hg_yrs:
+            path.append(hg_rate)
+        elif t <= hg_yrs + fade_yrs:
+            # Linear interpolation from hg_rate (start of fade) to term_g (end)
+            step = (t - hg_yrs) / fade_yrs
+            path.append(hg_rate + (term_g - hg_rate) * step)
+        else:
+            path.append(term_g)
+    return path
+
+
+def build_margin_path(simple_m, n, mode, terminal_m):
+    """Generate a per-year EBIT margin list.
+    Modes:
+      "Constant": flat margin for all years.
+      "Linear expansion": linear interpolation from simple_m (Year 1) to terminal_m (Year N).
+    """
+    if mode != "Linear expansion" or n < 2:
+        return [simple_m] * n
+    return [simple_m + (terminal_m - simple_m) * (t - 1) / (n - 1) for t in range(1, n + 1)]
+
+
+def compute_capm_wacc(rf, beta, erp, rd_pretax, w_debt, tx):
+    """Compute WACC from CAPM components.
+    cost_equity   = rf + beta × ERP
+    after_tax_rd  = rd_pretax × (1 − tax)
+    WACC          = w_equity × cost_equity + w_debt × after_tax_rd
+    Returns (wacc, cost_equity, after_tax_rd) — all decimals.
+    """
+    cost_equity  = rf + beta * erp
+    after_tax_rd = rd_pretax * (1 - tx)
+    w_equity     = 1 - w_debt
+    wacc         = w_equity * cost_equity + w_debt * after_tax_rd
+    return wacc, cost_equity, after_tax_rd
+
+
+def run_dcf(rev0, growth_path, margin_path, tx, ri, w, tg, n,
+            *, mid_year=False, tv_method="Gordon Growth", exit_multiple=10.0,
+            nwc_pct=0.0, prev_revenue=None):
+    """Run a DCF projection with per-year growth and margin paths.
+
+    growth_path[t] applies to Year t+1 (compounded onto prior year's revenue).
+    margin_path[t] is the EBIT margin for Year t+1.
+    nwc_pct is change in net working capital as % of revenue change (deducted from FCF).
+    mid_year=True uses (t-0.5) exponent for discounting (assumes cash arrives mid-year).
+    tv_method='Exit Multiple' computes terminal value as exit_multiple × EBITDA_N
+        (we approximate EBITDA ≈ EBIT × 1.15 since D&A isn't separately modelled here).
+    """
+    revenues, ebits, nopats, reinvs, nwcs, fcfs, dfs, pvs = [], [], [], [], [], [], [], []
+    rev = rev0
+    prev_rev = prev_revenue if prev_revenue is not None else rev0
+    for t in range(n):
+        g_t = growth_path[t]
+        m_t = margin_path[t]
+        new_rev = rev * (1 + g_t)
+        d_rev   = new_rev - prev_rev
+        rev     = new_rev
+        ebit    = rev * m_t
+        nopat   = ebit * (1 - tx)
+        reinv   = nopat * ri
+        nwc     = max(0, d_rev * nwc_pct)  # only deduct if revenue grew
+        fcf     = nopat - reinv - nwc
+        # Discounting: end-year (t) or mid-year (t - 0.5)
+        exp = (t + 0.5) if mid_year else (t + 1)
+        df = 1 / (1 + w) ** exp
+        pv = fcf * df
+        revenues.append(rev); ebits.append(ebit); nopats.append(nopat)
+        reinvs.append(reinv); nwcs.append(nwc); fcfs.append(fcf); dfs.append(df); pvs.append(pv)
+        prev_rev = rev
+
+    sum_pv_fcf = sum(pvs)
+    last_fcf  = fcfs[-1] if fcfs else 0
+    last_ebit = ebits[-1] if ebits else 0
+    if tv_method == "Exit Multiple":
+        # EBITDA ≈ EBIT × 1.15 as a rough proxy (no D&A line modelled here)
+        terminal_value = exit_multiple * (last_ebit * 1.15)
+        terminal_fcf   = last_fcf * (1 + tg)  # only used for display
+    else:
+        terminal_fcf   = last_fcf * (1 + tg)
+        terminal_value = terminal_fcf / (w - tg) if w > tg else float("nan")
+    # Discount terminal value back: end-year uses (1+w)^n, mid-year uses (1+w)^(n-0.5)
+    tv_exp = (n - 0.5) if mid_year else n
+    pv_terminal = terminal_value / (1 + w) ** tv_exp if n > 0 else 0
+    return {
+        "revenues": revenues, "ebits": ebits, "nopats": nopats, "reinvs": reinvs,
+        "nwcs": nwcs, "fcfs": fcfs, "dfs": dfs, "pvs": pvs,
+        "growth_path": growth_path, "margin_path": margin_path,
+        "sum_pv_fcf": sum_pv_fcf,
+        "terminal_fcf": terminal_fcf,
+        "terminal_value": terminal_value,
+        "pv_terminal": pv_terminal,
+        "enterprise_value": sum_pv_fcf + pv_terminal,
+        "tv_method": tv_method,
+    }
+
+
+# Build growth + margin paths from the user's choice of mode
+growth_path = build_growth_path(
+    growth, years, st.session_state.growth_mode,
+    st.session_state.high_growth / 100,
+    st.session_state.high_years,
+    st.session_state.fade_years,
+    term_g,
+)
+margin_path = build_margin_path(
+    margin, years, st.session_state.margin_mode,
+    st.session_state.margin_terminal / 100,
+)
+
+# Compute WACC — either from CAPM components or use direct entry
+if st.session_state.wacc_mode == "CAPM build-up":
+    wacc, cost_equity, after_tax_rd = compute_capm_wacc(
+        st.session_state.rf / 100,
+        st.session_state.beta,
+        st.session_state.erp / 100,
+        st.session_state.rd_pretax / 100,
+        st.session_state.weight_debt / 100,
+        tax_rate,
+    )
+
+# Now validate (WACC has been resolved either way)
 input_errors = []
 if revenue <= 0:
     input_errors.append("Revenue must be > 0.")
@@ -455,47 +700,18 @@ if wacc <= term_g:
     )
 if shares <= 0:
     input_errors.append("Shares Outstanding must be > 0.")
-
 if input_errors:
     st.error("⚠️ **Cannot run DCF — please fix these inputs first:**\n\n" +
              "\n".join(f"- {e}" for e in input_errors))
     st.stop()
 
-
-# =============================================================================
-# DCF Calculation
-# =============================================================================
-def run_dcf(rev0, g, m, tx, ri, w, tg, n):
-    """Run a DCF projection. Returns a dict with all intermediate values."""
-    revenues, ebits, nopats, reinvs, fcfs, dfs, pvs = [], [], [], [], [], [], []
-    rev = rev0
-    for t in range(1, n + 1):
-        rev = rev * (1 + g)
-        ebit = rev * m
-        nopat = ebit * (1 - tx)
-        reinv = nopat * ri
-        fcf = nopat - reinv
-        df = 1 / (1 + w) ** t
-        pv = fcf * df
-        revenues.append(rev); ebits.append(ebit); nopats.append(nopat)
-        reinvs.append(reinv); fcfs.append(fcf); dfs.append(df); pvs.append(pv)
-
-    sum_pv_fcf = sum(pvs)
-    terminal_fcf = fcfs[-1] * (1 + tg)
-    terminal_value = terminal_fcf / (w - tg) if w > tg else float("nan")
-    pv_terminal = terminal_value / (1 + w) ** n
-    return {
-        "revenues": revenues, "ebits": ebits, "nopats": nopats, "reinvs": reinvs,
-        "fcfs": fcfs, "dfs": dfs, "pvs": pvs,
-        "sum_pv_fcf": sum_pv_fcf,
-        "terminal_fcf": terminal_fcf,
-        "terminal_value": terminal_value,
-        "pv_terminal": pv_terminal,
-        "enterprise_value": sum_pv_fcf + pv_terminal,
-    }
-
-
-dcf = run_dcf(revenue, growth, margin, tax_rate, reinvest_rate, wacc, term_g, years)
+dcf = run_dcf(
+    revenue, growth_path, margin_path, tax_rate, reinvest_rate, wacc, term_g, years,
+    mid_year=st.session_state.mid_year,
+    tv_method=st.session_state.tv_method,
+    exit_multiple=st.session_state.exit_multiple,
+    nwc_pct=st.session_state.nwc_pct / 100,
+)
 
 enterprise_value = dcf["enterprise_value"]
 equity_value     = enterprise_value - debt + cash
@@ -525,13 +741,59 @@ m3.metric("Upside / (Downside)", f"{upside:+.1%}",
           delta_color="normal" if abs(upside) < 0.05 else ("inverse" if upside < 0 else "normal"))
 m4.metric("Margin of Safety", f"{mos:+.1%}")
 
-# Verdict box
-if abs(upside) < 0.10:
-    st.info(f"⚖️  **Fairly Valued** — DCF intrinsic value is within ±10% of market price.")
+# Verdict box (threshold customisable in Advanced settings)
+fair_band = st.session_state.fair_band / 100
+if abs(upside) < fair_band:
+    st.info(f"⚖️  **Fairly Valued** — DCF intrinsic value is within ±{fair_band*100:.0f}% of market price.")
 elif upside > 0:
     st.success(f"📈 **Potentially Undervalued** — DCF estimates the stock is worth {upside:.1%} more than its current price.")
 else:
     st.warning(f"📉 **Potentially Overvalued** — Market is paying {-upside:.1%} above the DCF estimate.")
+
+
+# =============================================================================
+# CAPM WACC build-up panel (only when CAPM mode is active)
+# =============================================================================
+if st.session_state.wacc_mode == "CAPM build-up":
+    with st.expander(f"💸 WACC build-up (CAPM) → **{wacc*100:.2f}%**", expanded=False):
+        st.latex(r"\text{Cost of Equity} = R_f + \beta \times \text{ERP}")
+        st.latex(r"\text{WACC} = \frac{E}{V} \times \text{Cost of Equity} + \frac{D}{V} \times R_d \times (1 - \text{tax})")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Risk-free Rate (Rf)", f"{st.session_state.rf:.2f}%")
+        c1.metric("Beta (β)", f"{st.session_state.beta:.2f}")
+        c2.metric("Equity Risk Premium", f"{st.session_state.erp:.2f}%")
+        c2.metric("Cost of Equity (Re)", f"{cost_equity*100:.2f}%")
+        c3.metric("Pre-tax Cost of Debt", f"{st.session_state.rd_pretax:.2f}%")
+        c3.metric("After-tax Cost of Debt", f"{after_tax_rd*100:.2f}%")
+        st.markdown(
+            f"**Capital structure:** {(100-st.session_state.weight_debt):.0f}% Equity / "
+            f"{st.session_state.weight_debt:.0f}% Debt  →  "
+            f"**WACC = {wacc*100:.2f}%**"
+        )
+
+
+# =============================================================================
+# Multi-stage growth / margin path display (only when non-constant)
+# =============================================================================
+if st.session_state.growth_mode != "Constant" or st.session_state.margin_mode != "Constant":
+    with st.expander("📐 Growth & Margin Path (per year)", expanded=False):
+        path_df = pd.DataFrame({
+            "Year":             [f"Year {t+1}" for t in range(years)],
+            "Growth Rate":      [f"{g*100:.2f}%" for g in growth_path],
+            "EBIT Margin":      [f"{m*100:.2f}%" for m in margin_path],
+        })
+        st.dataframe(path_df, hide_index=True, use_container_width=True)
+        if st.session_state.growth_mode != "Constant":
+            st.caption(
+                f"3-stage growth: {st.session_state.high_years} years at "
+                f"{st.session_state.high_growth:.1f}%, then {st.session_state.fade_years}-year "
+                f"linear fade to {st.session_state.terminal_growth:.2f}% terminal."
+            )
+        if st.session_state.margin_mode != "Constant":
+            st.caption(
+                f"Linear margin expansion: {st.session_state.margin:.1f}% → "
+                f"{st.session_state.margin_terminal:.1f}% over {years} years."
+            )
 
 
 # =============================================================================
@@ -698,9 +960,28 @@ def style_iv(val):
     else:              return "background-color: #fff9c4"   # yellow
 
 # Table 1: WACC × Terminal Growth
+# Run DCF with given overrides; reuses the live growth/margin paths and all advanced settings
+def _sens_dcf(rev=None, g=None, m=None, w=None, tg=None):
+    rev_use = revenue if rev is None else rev
+    g_use   = growth if g is None else g
+    m_use   = margin if m is None else m
+    w_use   = wacc if w is None else w
+    tg_use  = term_g if tg is None else tg
+    # Rebuild paths with the overridden simple growth/margin
+    gp = build_growth_path(g_use, years, st.session_state.growth_mode,
+                           st.session_state.high_growth/100,
+                           st.session_state.high_years, st.session_state.fade_years, tg_use)
+    mp = build_margin_path(m_use, years, st.session_state.margin_mode,
+                           st.session_state.margin_terminal/100)
+    return run_dcf(rev_use, gp, mp, tax_rate, reinvest_rate, w_use, tg_use, years,
+                   mid_year=st.session_state.mid_year,
+                   tv_method=st.session_state.tv_method,
+                   exit_multiple=st.session_state.exit_multiple,
+                   nwc_pct=st.session_state.nwc_pct/100)
+
 st.markdown("### Table 1 — Intrinsic Value: WACC vs. Terminal Growth")
-wacc_range  = [round(wacc + dx, 4) for dx in [-0.02, -0.01, 0, 0.01, 0.02]]
-tg_range    = [round(term_g + dx, 4) for dx in [-0.01, -0.005, 0, 0.005, 0.01]]
+wacc_range = [round(wacc + dx, 4) for dx in [-0.02, -0.01, 0, 0.01, 0.02]]
+tg_range   = [round(term_g + dx, 4) for dx in [-0.01, -0.005, 0, 0.005, 0.01]]
 tbl1 = []
 for w in wacc_range:
     if w <= 0: continue
@@ -708,7 +989,7 @@ for w in wacc_range:
     for tg in tg_range:
         if tg < 0 or w <= tg:
             row.append(np.nan); continue
-        d = run_dcf(revenue, growth, margin, tax_rate, reinvest_rate, w, tg, years)
+        d = _sens_dcf(w=w, tg=tg)
         eq = d["enterprise_value"] - debt + cash
         row.append(eq / shares)
     tbl1.append(row)
@@ -731,7 +1012,7 @@ for g in g_range:
     row = []
     for m in m_range:
         if m <= 0: row.append(np.nan); continue
-        d = run_dcf(revenue, g, m, tax_rate, reinvest_rate, wacc, term_g, years)
+        d = _sens_dcf(g=g, m=m)
         eq = d["enterprise_value"] - debt + cash
         row.append(eq / shares)
     tbl2.append(row)
@@ -752,10 +1033,10 @@ st.markdown("---")
 # =============================================================================
 # Excel export — download a workbook that REPLICATES the DCF using formulas
 # =============================================================================
-st.markdown("## 📥 Excel Replication")
+st.markdown("## 📥 Export to Excel")
 st.caption(
-    "Download an Excel workbook where every value is a live formula — change any input "
-    "and the model recomputes. Use this for the assignment's Replicability requirement."
+    "Download a fully editable Excel workbook with live formulas — every projection cell "
+    "references the inputs sheet, so you can modify any assumption and the entire model recomputes."
 )
 
 def build_excel_workbook():
@@ -902,7 +1183,7 @@ def build_excel_workbook():
             if tg_val < 0 or w_val <= tg_val:
                 ws3.cell(row=4 + i, column=2 + j, value="N/A")
                 continue
-            dd = run_dcf(revenue, growth, margin, tax_rate, reinvest_rate, w_val, tg_val, years)
+            dd = _sens_dcf(w=w_val, tg=tg_val)
             eq = dd["enterprise_value"] - debt + cash
             ws3.cell(row=4 + i, column=2 + j, value=eq / shares).number_format = "$#,##0.00"
 
@@ -961,30 +1242,32 @@ st.markdown("---")
 # =============================================================================
 # Methodology note (always visible at bottom)
 # =============================================================================
-with st.expander("📖 Methodology & Notes"):
+with st.expander("📖 Methodology"):
     st.markdown("""
-**Discounted Cash Flow (DCF) Model**
+**Discounted Cash Flow Model**
 
-Estimates a stock's intrinsic value from its expected future cash flows, discounted to present value at the firm's cost of capital (WACC).
+Estimates a stock's intrinsic value from expected future cash flows, discounted to present value at the firm's cost of capital (WACC).
 
 **Steps:**
-1. **Forecast** revenue, EBIT, NOPAT, and free cash flow for an explicit period (3-10 years).
-2. **Discount** each year's FCF back to today using `1/(1+WACC)^t`.
-3. **Terminal Value** captures everything beyond the forecast period: `FCF_N × (1+g) / (WACC − g)`.
+1. **Forecast** revenue, EBIT, NOPAT, and free cash flow for an explicit period (3-15 years).
+2. **Discount** each year's FCF to today using `1/(1+WACC)^t`.
+3. **Terminal Value** captures everything beyond the forecast: `FCF_N × (1+g) / (WACC − g)`.
 4. **Enterprise Value** = Σ PV of FCFs + PV of Terminal Value.
 5. **Equity Value** = EV − Debt + Cash.
-6. **Per-share** = Equity Value ÷ Shares Outstanding.
+6. **Per-share** = Equity Value ÷ Diluted Shares Outstanding.
 
-**Inputs to think about:**
-- **Growth rate** — drawn from historical CAGR + your forward thesis. For mature firms, a few percent above GDP. For growth firms, double-digit but converging downward.
+**WACC build-up (CAPM):** WACC = (E/V) × [Rf + β × ERP] + (D/V) × Rd × (1 − tax).
+
+**Multi-stage growth (3-stage):** Years 1 to N₁ at the high-growth rate; Years N₁+1 to N₁+N₂ linearly fade to the terminal rate; Years beyond compound at the terminal rate (also used for the perpetuity).
+
+**Margin expansion:** Optionally model margins improving (or compressing) linearly between Year 1 and Year N. Useful for growth firms with operating leverage.
+
+**Input guidance:**
+- **Growth rate** — informed by historical CAGR + forward thesis. Mature firms: a few % above GDP. Growth firms: double-digit, fading down.
 - **EBIT margin** — historical operating margin. Better firms expand margins over time.
-- **WACC** — riskier firms have higher WACC. As a rough guide: large-cap stable = 7–9%, mid-cap = 9–12%, small/risky = 12%+.
-- **Terminal growth** — should never exceed long-run GDP (~2-3%) over the very long run.
-- **Reinvestment rate** — % of NOPAT plowed back into CapEx + working capital. Higher reinvestment = lower FCF today but more future growth.
+- **WACC** — riskier firms have higher WACC. Rough guide: large-cap stable 7–9%, mid-cap 9–12%, small/risky 12%+.
+- **Terminal growth** — should not exceed long-run GDP (~2-3%) over the very long run.
+- **Reinvestment rate** — % of NOPAT going back into CapEx + working capital. Higher reinvestment = less FCF today, more future growth.
 
-**Data source (when auto-fill is used):** SEC EDGAR's official Company Facts API (`data.sec.gov`). Pulls the latest 10-K line items — same numbers any analyst would use.
-
-**This app does NOT use Yahoo Finance** — it relies only on SEC filings (which are 100% reliable) and your manual inputs (which you control).
+**Data source:** SEC EDGAR Company Facts API (`data.sec.gov`) — official filings, used by professional analysts.
     """)
-
-st.caption(f"FINA 4011/5011 · Project 2 · DCF Equity Valuation · Built with Streamlit")
