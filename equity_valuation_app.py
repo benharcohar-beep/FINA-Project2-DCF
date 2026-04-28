@@ -236,12 +236,12 @@ def fetch_edgar_fundamentals(symbol: str):
 DEFAULTS = {
     "ticker":          "AAPL",
     "company_name":    "Apple Inc.",
-    "revenue":         391000.0,   # $M (AAPL FY24)
-    "growth":          7.0,        # %
+    "revenue":         391000.0,   # $M (AAPL FY24 starting point)
+    "growth":          8.0,        # % — modest growth above GDP
     "margin":          30.0,       # % EBIT margin
     "tax_rate":        21.0,       # %
-    "reinvest_rate":   25.0,       # % of NOPAT
-    "wacc":            9.0,        # %
+    "reinvest_rate":   15.0,       # % of NOPAT — mature firms reinvest less
+    "wacc":            8.5,        # % — large-cap blue chip
     "terminal_growth": 2.5,        # %
     "years":           5,
     "debt":            107000.0,   # $M
@@ -274,6 +274,16 @@ DEFAULTS = {
     # Working capital change as a separate driver
     "nwc_pct":         2.0,        # change in NWC as % of revenue (deducted from FCF)
 }
+# Process pending reset BEFORE any widget instantiates — Streamlit doesn't
+# allow modifying a widget's session_state after the widget has been rendered
+# in the same script run. Reset button just sets a flag; the actual restore
+# happens here at the top of the next run.
+if st.session_state.pop("_pending_reset", False):
+    for k in list(st.session_state.keys()):
+        if k in DEFAULTS:
+            del st.session_state[k]
+
+# Initialize defaults for any keys not yet in session_state
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -372,8 +382,9 @@ with st.sidebar:
             st.rerun()
     with col_b:
         if st.button("🧹 Reset", use_container_width=True, help="Reset all inputs to defaults"):
-            for k, v in DEFAULTS.items():
-                st.session_state[k] = v
+            # Defer the actual reset to the top of the next run — see notes there
+            st.session_state["_pending_reset"] = True
+            st.session_state["edgar_msg"] = None
             st.rerun()
 
     # ── Render the last EDGAR-fetch message inline (set by the callback / button) ──
@@ -749,6 +760,15 @@ elif upside > 0:
     st.success(f"📈 **Potentially Undervalued** — DCF estimates the stock is worth {upside:.1%} more than its current price.")
 else:
     st.warning(f"📉 **Potentially Overvalued** — Market is paying {-upside:.1%} above the DCF estimate.")
+
+# Hint when DCF is meaningfully below market — common for premium-priced stocks
+if upside < -0.30:
+    st.caption(
+        "💡 *DCF often produces lower values than market price for high-multiple stocks. "
+        "The market may be pricing in faster growth, margin expansion, or longer-than-modeled growth. "
+        "Try increasing **growth rate**, increasing **EBIT margin**, lowering **WACC**, or extending the **forecast horizon** "
+        "to model a more bullish view. Use the sensitivity tables to see what assumptions justify the market price.*"
+    )
 
 
 # =============================================================================
