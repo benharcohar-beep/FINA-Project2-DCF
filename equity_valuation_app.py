@@ -278,51 +278,71 @@ with st.sidebar:
             with st.spinner("Fetching from SEC EDGAR..."):
                 edgar = fetch_edgar_fundamentals(st.session_state.ticker)
             if edgar:
-                # Only overwrite a field when EDGAR returned a real (positive) value.
-                # Missing / zero values are kept as the existing user input or default —
-                # never silently corrupt the model with a 0 share count, etc.
-                def _set(key, val, min_val=0):
-                    if val is None:
-                        return
-                    try:
-                        v = float(val)
-                    except (TypeError, ValueError):
-                        return
-                    if v <= min_val:
-                        return
-                    st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
-
-                if edgar.get("name"):
-                    st.session_state.company_name = edgar["name"]
-                _set("revenue",       edgar.get("revenue"))
-                _set("margin",        edgar.get("ebit_margin"))
-                _set("shares",        edgar.get("shares"))
-                _set("growth",        edgar.get("revenue_cagr"))
-                # Cash and debt CAN legitimately be zero → use a separate path
-                if edgar.get("cash") is not None and edgar.get("cash") >= 0:
-                    st.session_state.cash = round(edgar["cash"], 0)
-                if edgar.get("debt") is not None and edgar.get("debt") >= 0:
-                    st.session_state.debt = round(edgar["debt"], 0)
-
-                # Reinvestment rate ≈ CapEx / NOPAT — only compute if all parts valid
-                if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
-                    nopat = edgar["revenue"] * (edgar["ebit_margin"] / 100) * (1 - st.session_state.tax_rate / 100)
-                    if nopat > 0:
-                        ri = min(100, edgar["capex"] / nopat * 100)
-                        if ri > 0:
-                            st.session_state.reinvest_rate = round(ri, 1)
-
-                st.session_state.edgar_data = edgar
-                fy = edgar.get("fy_end", "?")
-                if edgar.get("missing"):
-                    st.warning(
-                        f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}). "
-                        f"EDGAR didn't have: **{', '.join(edgar['missing'])}** — "
-                        "left at default. Edit these fields below if you need different values."
+                # ── Sanity check first: a DCF requires positive revenue. ──
+                # Pre-revenue companies (junior miners, early biotech, dev-stage SPACs)
+                # can't be valued via DCF — refuse to overwrite the user's working
+                # defaults with an inconsistent partial fill that produces nonsense.
+                edgar_rev = edgar.get("revenue")
+                if not edgar_rev or edgar_rev <= 0:
+                    st.session_state.edgar_data = None  # don't show the reference panel
+                    st.error(
+                        f"⛔ **{edgar.get('name', st.session_state.ticker)}** "
+                        "appears to be a **pre-revenue company** (no operating revenue in latest 10-K). "
+                        "DCF requires positive cash flows, so auto-fill won't work here. "
+                        "Suggestions:\n\n"
+                        "- Try a revenue-generating ticker (AAPL, MSFT, JNJ, KO)\n"
+                        "- For pre-revenue / dev-stage companies, use **asset-based valuation** instead\n"
+                        "- Or override Revenue, Margin, Shares manually below if you have a forecast"
                     )
                 else:
-                    st.success(f"✅ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy})")
-                st.rerun()
+                    # Only overwrite a field when EDGAR returned a real (positive) value.
+                    # Missing / zero values are kept as the existing user input or default.
+                    def _set(key, val, min_val=0):
+                        if val is None: return
+                        try: v = float(val)
+                        except (TypeError, ValueError): return
+                        if v <= min_val: return
+                        st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
+
+                    if edgar.get("name"):
+                        st.session_state.company_name = edgar["name"]
+                    _set("revenue",  edgar.get("revenue"))
+                    _set("margin",   edgar.get("ebit_margin"))
+                    _set("shares",   edgar.get("shares"))
+                    _set("growth",   edgar.get("revenue_cagr"))
+                    # Cash and debt can legitimately be zero
+                    if edgar.get("cash") is not None and edgar.get("cash") >= 0:
+                        st.session_state.cash = round(edgar["cash"], 0)
+                    if edgar.get("debt") is not None and edgar.get("debt") >= 0:
+                        st.session_state.debt = round(edgar["debt"], 0)
+                    # Reinvestment rate ≈ CapEx / NOPAT — only compute if all parts valid
+                    if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
+                        nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
+                        if nopat > 0:
+                            ri = min(100, edgar["capex"] / nopat * 100)
+                            if ri > 0:
+                                st.session_state.reinvest_rate = round(ri, 1)
+
+                    st.session_state.edgar_data = edgar
+                    fy = edgar.get("fy_end", "?")
+
+                    # Warn if the company is unprofitable — DCF will still run but the
+                    # extrapolation from a loss-making base year is unreliable.
+                    if edgar.get("ebit_margin") is None:
+                        st.warning(
+                            f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}), "
+                            "but operating margin couldn't be determined (likely a loss-making year). "
+                            "DCF results will reflect your manual margin assumption, not the company's actuals."
+                        )
+                    elif edgar.get("missing"):
+                        st.warning(
+                            f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}). "
+                            f"EDGAR didn't have: **{', '.join(edgar['missing'])}** — "
+                            "left at default. Edit these fields below if needed."
+                        )
+                    else:
+                        st.success(f"✅ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy})")
+                    st.rerun()
             else:
                 st.error(
                     "❌ Ticker not found in EDGAR (or filings unavailable). "
@@ -500,10 +520,15 @@ if st.session_state.edgar_data:
                 st.dataframe(hist_df, hide_index=True, use_container_width=True)
         with c2:
             st.markdown("**Computed metrics:**")
-            st.write(f"- 3-yr Revenue CAGR: **{e.get('revenue_cagr',0):.1f}%**")
-            st.write(f"- Operating Cash Flow: **${e.get('operating_cf',0)/1000:.1f}B**")
-            st.write(f"- CapEx: **${e.get('capex',0)/1000:.1f}B**")
-            st.write(f"- Implied FCF: **${(e.get('operating_cf',0)-e.get('capex',0))/1000:.1f}B**")
+            def _fmt_pct(v): return f"{v:.1f}%" if isinstance(v, (int, float)) else "N/A"
+            def _fmt_b(v):   return f"${v/1000:.1f}B" if isinstance(v, (int, float)) else "N/A"
+            ocf_v   = e.get("operating_cf")
+            capex_v = e.get("capex")
+            fcf_v   = (ocf_v - capex_v) if (isinstance(ocf_v, (int, float)) and isinstance(capex_v, (int, float))) else None
+            st.write(f"- 3-yr Revenue CAGR: **{_fmt_pct(e.get('revenue_cagr'))}**")
+            st.write(f"- Operating Cash Flow: **{_fmt_b(ocf_v)}**")
+            st.write(f"- CapEx: **{_fmt_b(capex_v)}**")
+            st.write(f"- Implied FCF: **{_fmt_b(fcf_v)}**")
         st.caption("Source: data.sec.gov XBRL Company Facts API · Used as starting point — every input above is editable.")
 
 
