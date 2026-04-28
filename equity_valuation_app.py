@@ -229,6 +229,229 @@ def _safe_yf_call(fn, default=None):
         return default
 
 
+# =============================================================================
+# SEC EDGAR fallback — official US securities regulator API.
+# Free, no API key, not rate-limited beyond the User-Agent requirement.
+# US-listed companies only. Provides ALL 10-K/10-Q line items in JSON.
+# =============================================================================
+_SEC_HEADERS = {
+    "User-Agent": "FINA4011-DCF-App academic-project@university.edu",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
+}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _edgar_ticker_to_cik(sym: str):
+    """Map a ticker symbol to its 10-digit CIK. Cached for a day."""
+    try:
+        import requests as _r
+        url = "https://www.sec.gov/files/company_tickers.json"
+        r = _r.get(url, headers={"User-Agent": _SEC_HEADERS["User-Agent"]}, timeout=10)
+        if r.status_code != 200:
+            return None, None
+        data = r.json()
+        sym_u = sym.upper()
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == sym_u:
+                cik = str(entry["cik_str"]).zfill(10)
+                return cik, entry.get("title", sym)
+        return None, None
+    except Exception:
+        return None, None
+
+
+def _latest_annual(facts_block, prefer_form="10-K"):
+    """Given a single XBRL concept's facts block, return the most recent annual value
+    and a sorted list of (year, val) tuples for historical series.
+
+    EDGAR's `fy` field is unreliable (it's the fiscal year of the FILING, not the
+    period). We identify true annual values by duration: rows where end-start is
+    350-380 days. Group by the year of the `end` date, take the most recently
+    filed row per year. Works for any fiscal year calendar.
+    """
+    if not facts_block:
+        return None, []
+    from datetime import datetime
+    units = facts_block.get("units", {}) or {}
+    rows = units.get("USD") or units.get("shares") or next(iter(units.values()), [])
+
+    annual_rows = []
+    for r in rows:
+        start, end = r.get("start"), r.get("end")
+        if not start or not end:
+            # Balance sheet items have only `end` (instant) — keep them
+            if end and not start:
+                annual_rows.append(r)
+            continue
+        try:
+            d = (datetime.fromisoformat(end) - datetime.fromisoformat(start)).days
+            if 350 <= d <= 380:
+                annual_rows.append(r)
+        except Exception:
+            continue
+
+    if not annual_rows:
+        return None, []
+
+    # Filter to 10-K filings if available, otherwise accept any form
+    tenk = [r for r in annual_rows if r.get("form") == prefer_form]
+    if tenk:
+        annual_rows = tenk
+
+    # Group by the calendar year of the `end` date — this is the fiscal year
+    # ending in that year (e.g. MSFT's FY2024 ends June 2024 → year_key=2024)
+    by_year = {}
+    for r in annual_rows:
+        try:
+            year_key = datetime.fromisoformat(r["end"]).year
+        except Exception:
+            continue
+        existing = by_year.get(year_key)
+        if existing is None or r.get("filed", "") > existing.get("filed", ""):
+            by_year[year_key] = r
+
+    series = sorted(by_year.items(), key=lambda kv: kv[0], reverse=True)
+    if not series:
+        return None, []
+    latest_val = series[0][1].get("val")
+    historical = [(yr, row["val"]) for yr, row in series if row.get("val") is not None]
+    return latest_val, historical
+
+
+def _best_concept(us_gaap, *names):
+    """Return the concept block with the most recent FY data among the given tags.
+    Companies switch tags over time (e.g. `Revenues` → `RevenueFromContractWith...`
+    after ASC 606), so picking the freshest one matters.
+    """
+    best = None
+    best_year = -1
+    for n in names:
+        block = us_gaap.get(n)
+        if not block:
+            continue
+        units = block.get("units", {}) or {}
+        rows = units.get("USD") or units.get("shares") or next(iter(units.values()), [])
+        annuals = [r for r in rows if r.get("fp") == "FY" and r.get("fy")]
+        if not annuals:
+            continue
+        max_fy = max(r["fy"] for r in annuals)
+        if max_fy > best_year:
+            best_year = max_fy
+            best = block
+    return best
+
+
+# Backward-compat alias used in earlier code
+_first_concept = _best_concept
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _edgar_fundamentals(sym: str):
+    """Pull fundamentals from SEC EDGAR Company Facts API.
+    Returns a dict with the same shape as the yfinance result, or None on failure.
+    """
+    try:
+        import requests as _r
+        cik, name = _edgar_ticker_to_cik(sym)
+        if cik is None:
+            return None
+        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+        r = _r.get(url, headers=_SEC_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        facts = data.get("facts", {}) or {}
+        us_gaap = facts.get("us-gaap", {}) or {}
+        dei = facts.get("dei", {}) or {}
+
+        # ── Pull concepts (with fallback tag names per company filing style) ──
+        revenue_block   = _first_concept(us_gaap, "Revenues",
+                                         "RevenueFromContractWithCustomerExcludingAssessedTax",
+                                         "SalesRevenueNet")
+        op_income_block = _first_concept(us_gaap, "OperatingIncomeLoss")
+        net_income_block= _first_concept(us_gaap, "NetIncomeLoss")
+        ocf_block       = _first_concept(us_gaap, "NetCashProvidedByUsedInOperatingActivities")
+        capex_block     = _first_concept(us_gaap, "PaymentsToAcquirePropertyPlantAndEquipment")
+        da_block        = _first_concept(us_gaap, "DepreciationDepletionAndAmortization",
+                                         "DepreciationAndAmortization", "Depreciation")
+        cash_block      = _first_concept(us_gaap, "CashAndCashEquivalentsAtCarryingValue",
+                                         "Cash", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents")
+        debt_lt_block   = _first_concept(us_gaap, "LongTermDebt", "LongTermDebtNoncurrent")
+        debt_st_block   = _first_concept(us_gaap, "LongTermDebtCurrent", "DebtCurrent")
+        shares_block    = _first_concept(dei, "EntityCommonStockSharesOutstanding")
+
+        rev_latest,  rev_series  = _latest_annual(revenue_block)
+        op_latest,   op_series   = _latest_annual(op_income_block)
+        ni_latest,   _           = _latest_annual(net_income_block)
+        ocf_latest,  _           = _latest_annual(ocf_block)
+        cx_latest,   _           = _latest_annual(capex_block)
+        da_latest,   da_series   = _latest_annual(da_block)
+        cash_latest, _           = _latest_annual(cash_block)
+        dlt_latest,  _           = _latest_annual(debt_lt_block)
+        dst_latest,  _           = _latest_annual(debt_st_block)
+        shares_latest, _         = _latest_annual(shares_block)
+
+        # Synthesize info dict (price/beta/PE come from elsewhere — left blank)
+        info = {
+            "longName": name or sym,
+            "shortName": sym,
+            "totalRevenue": rev_latest,
+            "sharesOutstanding": shares_latest,
+            "totalDebt": (dlt_latest or 0) + (dst_latest or 0) if (dlt_latest or dst_latest) else None,
+            "totalCash": cash_latest,
+            "beta": 1.0,  # default — assignment can override in sidebar
+            "sector": "N/A (SEC EDGAR)",
+            "industry": "N/A (SEC EDGAR)",
+            "longBusinessSummary": (
+                f"Fundamentals sourced from SEC EDGAR (CIK {cik}). "
+                "Real-time price + analyst targets unavailable from this source — "
+                "enter them manually in the sidebar if needed."
+            ),
+        }
+
+        # Synthesize financials DataFrame (yfinance shape: rows=lineitem, cols=year-end)
+        # Use actual fiscal-year-end dates from the EDGAR rows (works for any FY calendar)
+        def _year_end_ts(yr):
+            return pd.Timestamp(f"{yr}-12-31")
+
+        financials = pd.DataFrame()
+        if rev_series:
+            cols = [_year_end_ts(yr) for yr, _ in rev_series[:5]]
+            financials = pd.DataFrame(index=["Total Revenue", "Operating Income", "EBIT"], columns=cols, dtype=float)
+            for yr, val in rev_series[:5]:
+                financials.loc["Total Revenue", _year_end_ts(yr)] = val
+            if op_series:
+                for yr, val in op_series[:5]:
+                    col = _year_end_ts(yr)
+                    if col in financials.columns:
+                        financials.loc["Operating Income", col] = val
+                        financials.loc["EBIT", col] = val
+
+        # Synthesize cashflow DataFrame (one column = latest year, just for D&A lookup)
+        cashflow = pd.DataFrame()
+        if da_series:
+            cols = [_year_end_ts(yr) for yr, _ in da_series[:5]]
+            cashflow = pd.DataFrame(
+                index=["Depreciation And Amortization", "Depreciation"],
+                columns=cols, dtype=float,
+            )
+            for yr, val in da_series[:5]:
+                col = _year_end_ts(yr)
+                cashflow.loc["Depreciation And Amortization", col] = val
+                cashflow.loc["Depreciation", col] = val
+
+        return {
+            "info": info,
+            "financials": financials,
+            "cashflow": cashflow,
+            "balance_sheet": pd.DataFrame(),
+            "price_hist": pd.DataFrame(),
+            "error": None,
+        }
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, show_spinner="Fetching data from Yahoo Finance...")
 def fetch_stock_data(sym, max_retries: int = 3):
     """Fetch Yahoo Finance data with browser-impersonation session + retry/backoff.
@@ -273,31 +496,48 @@ def fetch_stock_data(sym, max_retries: int = 3):
         delay = min(2 * (2 ** attempt) + random.uniform(0, 1.5), 12)
         time.sleep(delay)
 
-    # Yahoo's info endpoint fully failed — try Yahoo's chart endpoint (different
-    # rate-limit bucket, used by Yahoo's own site) so the app can still run
+    # Yahoo's info endpoint fully failed — combine SEC EDGAR (fundamentals) +
+    # Yahoo's chart endpoint (price). EDGAR is rock-solid; the chart endpoint
+    # is in a different rate-limit bucket from the info endpoint.
+    edgar = _edgar_fundamentals(sym)
     chart_close, chart_hist, chart_meta = _yahoo_chart_price(sym)
-    if chart_close is not None:
-        meta = chart_meta or {}
-        return {
-            "info": {
+
+    if edgar is not None or chart_close is not None:
+        # Merge: EDGAR fundamentals + chart price
+        info = (edgar["info"] if edgar else {}).copy() if edgar else {}
+        if chart_close is not None:
+            meta = chart_meta or {}
+            info.update({
                 "currentPrice": chart_close,
                 "regularMarketPrice": chart_close,
-                "longName": meta.get("longName") or meta.get("shortName") or sym,
-                "shortName": meta.get("shortName") or sym,
-                "sector": "N/A (chart fallback)",
-                "industry": "N/A (chart fallback)",
-                "beta": 1.0,
+                "longName": info.get("longName") or meta.get("longName") or meta.get("shortName") or sym,
+                "shortName": info.get("shortName") or meta.get("shortName") or sym,
                 "currency": meta.get("currency", "USD"),
                 "exchangeName": meta.get("exchangeName"),
-            },
-            "financials": pd.DataFrame(),
-            "cashflow": pd.DataFrame(),
-            "balance_sheet": pd.DataFrame(),
-            "price_hist": chart_hist if chart_hist is not None else pd.DataFrame(),
+            })
+            # Compute market cap from price × shares (if EDGAR gave us shares)
+            if info.get("sharesOutstanding"):
+                info["marketCap"] = chart_close * info["sharesOutstanding"]
+
+        # Pick best price history
+        price_hist = chart_hist if chart_hist is not None and not chart_hist.empty else pd.DataFrame()
+
+        # Sources used — for the warning message
+        sources = []
+        if edgar is not None: sources.append("SEC EDGAR (fundamentals)")
+        if chart_close is not None: sources.append("Yahoo chart endpoint (price)")
+        sources_str = " + ".join(sources)
+
+        return {
+            "info": info,
+            "financials":    edgar["financials"]    if edgar else pd.DataFrame(),
+            "cashflow":      edgar["cashflow"]      if edgar else pd.DataFrame(),
+            "balance_sheet": edgar["balance_sheet"] if edgar else pd.DataFrame(),
+            "price_hist": price_hist,
             "error": (
-                "Yahoo Finance fundamentals endpoint is rate-limiting Streamlit Cloud's IPs. "
-                "Showing live price from Yahoo's chart endpoint — enter fundamentals manually below "
-                "to run the DCF."
+                f"Yahoo Finance fundamentals rate-limited — using fallback sources: {sources_str}. "
+                "DCF will run on EDGAR's official 10-K data. Some fields (analyst targets, P/E, sector) "
+                "may show N/A. Manual override available below if anything looks wrong."
             ),
         }
 
