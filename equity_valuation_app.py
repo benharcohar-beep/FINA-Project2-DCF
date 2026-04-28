@@ -46,7 +46,15 @@ _SEC_HEADERS = {
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _ticker_to_cik(symbol: str):
-    """Map ticker → 10-digit CIK + company name. Cached for a day."""
+    """Map ticker → 10-digit CIK + company name. Cached for a day.
+
+    SEC normalises tickers using hyphens for share classes (BRK-B, BRK-A) but
+    users commonly type them with dots (BRK.B). Try a few variants.
+    """
+    if not symbol:
+        return None, None
+    sym_u = symbol.upper().strip()
+    variants = {sym_u, sym_u.replace(".", "-"), sym_u.replace("-", "."), sym_u.replace(".", "")}
     try:
         r = requests.get(
             "https://www.sec.gov/files/company_tickers.json",
@@ -56,7 +64,7 @@ def _ticker_to_cik(symbol: str):
         if r.status_code != 200:
             return None, None
         for entry in r.json().values():
-            if entry.get("ticker", "").upper() == symbol.upper():
+            if entry.get("ticker", "").upper() in variants:
                 return str(entry["cik_str"]).zfill(10), entry.get("title", symbol)
     except Exception:
         pass
@@ -150,47 +158,79 @@ def fetch_edgar_fundamentals(symbol: str):
             return None
         ug = r.json().get("facts", {}).get("us-gaap", {}) or {}
         dei = r.json().get("facts", {}).get("dei", {}) or {}
+        # Combined namespace lookup for shares (dei + us-gaap — companies use either)
+        all_facts = {**ug, **dei}
 
         rev,    rev_hist = _latest_annual(_best_concept(ug,
             "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "SalesRevenueNet"))
-        opinc,  _        = _latest_annual(_best_concept(ug, "OperatingIncomeLoss"))
+            "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"))
+        # Operating income — use NetIncomeLoss as fallback for banks/insurers that don't report OpIncLoss
+        opinc,  _        = _latest_annual(_best_concept(ug,
+            "OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"))
+        net_inc, _       = _latest_annual(_best_concept(ug, "NetIncomeLoss",
+            "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"))
         ocf,    _        = _latest_annual(_best_concept(ug,
             "NetCashProvidedByUsedInOperatingActivities"))
         capex,  _        = _latest_annual(_best_concept(ug,
-            "PaymentsToAcquirePropertyPlantAndEquipment"))
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsToAcquireProductiveAssets"))
         cash,   _        = _latest_annual(_best_concept(ug,
-            "CashAndCashEquivalentsAtCarryingValue", "Cash"))
+            "CashAndCashEquivalentsAtCarryingValue",
+            "Cash",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"))
         dlt,    _        = _latest_annual(_best_concept(ug,
             "LongTermDebt", "LongTermDebtNoncurrent"))
         dst,    _        = _latest_annual(_best_concept(ug,
-            "LongTermDebtCurrent", "DebtCurrent"))
-        shares, _        = _latest_annual(_best_concept(dei,
+            "LongTermDebtCurrent", "DebtCurrent",
+            "ShortTermBorrowings"))
+        # Shares: try multiple tags across BOTH dei and us-gaap. Prefer diluted weighted-avg
+        # (standard for per-share metrics), fall back to common shares outstanding.
+        shares, _        = _latest_annual(_best_concept(all_facts,
+            "WeightedAverageNumberOfDilutedSharesOutstanding",
+            "WeightedAverageNumberOfSharesOutstandingBasic",
+            "CommonStockSharesOutstanding",
             "EntityCommonStockSharesOutstanding"))
 
-        # Compute derived metrics
-        ebit_margin = (opinc / rev) if (opinc and rev) else None
-        # Reinvestment rate ≈ CapEx / NOPAT (rough approximation)
-        # FCF history = OCF − CapEx, growth = CAGR over available years
+        # ── Derived metrics ───────────────────────────────────────────────
+        # EBIT margin: prefer real EBIT, else estimate from net income (assume 21% effective tax)
+        ebit_margin = None
+        if opinc and rev and opinc > 0:
+            ebit_margin = opinc / rev
+        elif net_inc and rev and net_inc > 0:
+            # Net income → pre-tax estimate (gross-up by 1/(1-0.21))
+            ebit_margin = (net_inc / 0.79) / rev
+
+        # Revenue CAGR over available history (uses up to 4-yr window for stability)
         revenue_cagr = None
-        if rev_hist and len(rev_hist) >= 4:
-            oldest = rev_hist[3][1]  # 4 years ago
+        if rev_hist and len(rev_hist) >= 2:
+            n_years = min(len(rev_hist) - 1, 4)
+            oldest = rev_hist[n_years][1]
             latest = rev_hist[0][1]
-            if oldest > 0:
-                revenue_cagr = (latest / oldest) ** (1 / 3) - 1
+            if oldest > 0 and n_years > 0:
+                revenue_cagr = (latest / oldest) ** (1 / n_years) - 1
+
+        # Track which fields couldn't be resolved — surface to user so they
+        # know which inputs to set manually instead of trusting a silent zero.
+        missing = []
+        if not rev:        missing.append("Revenue")
+        if not shares:     missing.append("Shares Outstanding")
+        if ebit_margin is None: missing.append("EBIT Margin")
+        if cash is None:   missing.append("Cash")
+        if not (dlt or dst): missing.append("Debt")
 
         return {
             "name":          name,
-            "revenue":       rev / 1e6 if rev else None,           # $M
-            "ebit_margin":   ebit_margin * 100 if ebit_margin else None,  # %
+            "revenue":       rev / 1e6 if rev else None,
+            "ebit_margin":   ebit_margin * 100 if ebit_margin else None,
             "operating_cf":  ocf / 1e6 if ocf else None,
             "capex":         capex / 1e6 if capex else None,
             "cash":          cash / 1e6 if cash else None,
             "debt":          ((dlt or 0) + (dst or 0)) / 1e6 if (dlt or dst) else None,
-            "shares":        shares / 1e6 if shares else None,     # millions
-            "revenue_cagr":  revenue_cagr * 100 if revenue_cagr else None,  # %
-            "rev_history":   [(y, v / 1e9) for y, v in rev_hist[:5]],  # $B for display
+            "shares":        shares / 1e6 if shares else None,
+            "revenue_cagr":  revenue_cagr * 100 if revenue_cagr else None,
+            "rev_history":   [(y, v / 1e9) for y, v in rev_hist[:5]],
             "fy_end":        rev_hist[0][0] if rev_hist else None,
+            "missing":       missing,
         }
     except Exception:
         return None
@@ -238,23 +278,57 @@ with st.sidebar:
             with st.spinner("Fetching from SEC EDGAR..."):
                 edgar = fetch_edgar_fundamentals(st.session_state.ticker)
             if edgar:
-                if edgar.get("name"):          st.session_state.company_name = edgar["name"]
-                if edgar.get("revenue"):       st.session_state.revenue = round(edgar["revenue"], 0)
-                if edgar.get("ebit_margin"):   st.session_state.margin = round(edgar["ebit_margin"], 1)
-                if edgar.get("debt") is not None:   st.session_state.debt = round(edgar["debt"], 0)
-                if edgar.get("cash") is not None:   st.session_state.cash = round(edgar["cash"], 0)
-                if edgar.get("shares"):        st.session_state.shares = round(edgar["shares"], 0)
-                if edgar.get("revenue_cagr"):  st.session_state.growth = round(edgar["revenue_cagr"], 1)
-                # Compute reinvestment rate ≈ CapEx / NOPAT
+                # Only overwrite a field when EDGAR returned a real (positive) value.
+                # Missing / zero values are kept as the existing user input or default —
+                # never silently corrupt the model with a 0 share count, etc.
+                def _set(key, val, min_val=0):
+                    if val is None:
+                        return
+                    try:
+                        v = float(val)
+                    except (TypeError, ValueError):
+                        return
+                    if v <= min_val:
+                        return
+                    st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
+
+                if edgar.get("name"):
+                    st.session_state.company_name = edgar["name"]
+                _set("revenue",       edgar.get("revenue"))
+                _set("margin",        edgar.get("ebit_margin"))
+                _set("shares",        edgar.get("shares"))
+                _set("growth",        edgar.get("revenue_cagr"))
+                # Cash and debt CAN legitimately be zero → use a separate path
+                if edgar.get("cash") is not None and edgar.get("cash") >= 0:
+                    st.session_state.cash = round(edgar["cash"], 0)
+                if edgar.get("debt") is not None and edgar.get("debt") >= 0:
+                    st.session_state.debt = round(edgar["debt"], 0)
+
+                # Reinvestment rate ≈ CapEx / NOPAT — only compute if all parts valid
                 if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
-                    nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
+                    nopat = edgar["revenue"] * (edgar["ebit_margin"] / 100) * (1 - st.session_state.tax_rate / 100)
                     if nopat > 0:
-                        st.session_state.reinvest_rate = round(min(100, edgar["capex"] / nopat * 100), 1)
+                        ri = min(100, edgar["capex"] / nopat * 100)
+                        if ri > 0:
+                            st.session_state.reinvest_rate = round(ri, 1)
+
                 st.session_state.edgar_data = edgar
-                st.success(f"✅ Loaded {edgar.get('name', st.session_state.ticker)} (FY{edgar.get('fy_end','?')})")
+                fy = edgar.get("fy_end", "?")
+                if edgar.get("missing"):
+                    st.warning(
+                        f"⚠️ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy}). "
+                        f"EDGAR didn't have: **{', '.join(edgar['missing'])}** — "
+                        "left at default. Edit these fields below if you need different values."
+                    )
+                else:
+                    st.success(f"✅ Loaded {edgar.get('name', st.session_state.ticker)} (FY{fy})")
                 st.rerun()
             else:
-                st.error("❌ Ticker not found in EDGAR. Use a US-listed ticker, or enter values manually.")
+                st.error(
+                    "❌ Ticker not found in EDGAR (or filings unavailable). "
+                    "EDGAR covers US-listed companies — try AAPL, MSFT, JNJ, etc. "
+                    "Or enter values manually below."
+                )
     with col_b:
         if st.button("🧹 Reset", use_container_width=True, help="Reset all inputs to defaults"):
             for k, v in DEFAULTS.items():
@@ -325,8 +399,27 @@ term_g        = float(st.session_state.terminal_growth) / 100
 years         = int(st.session_state.years)
 debt          = float(st.session_state.debt)
 cash          = float(st.session_state.cash)
-shares        = float(st.session_state.shares)
-price         = float(st.session_state.current_price)
+shares        = max(float(st.session_state.shares), 0.1)  # never zero (divide guard)
+price         = max(float(st.session_state.current_price), 0.01)
+
+# Validate inputs and surface clear errors before doing math.
+input_errors = []
+if revenue <= 0:
+    input_errors.append("Revenue must be > 0.")
+if margin <= 0:
+    input_errors.append("EBIT Margin must be > 0% (the firm needs operating profit for DCF to work).")
+if wacc <= term_g:
+    input_errors.append(
+        f"WACC ({wacc*100:.2f}%) must be greater than Terminal Growth ({term_g*100:.2f}%) — "
+        "otherwise the Gordon Growth formula explodes to infinity."
+    )
+if shares <= 0:
+    input_errors.append("Shares Outstanding must be > 0.")
+
+if input_errors:
+    st.error("⚠️ **Cannot run DCF — please fix these inputs first:**\n\n" +
+             "\n".join(f"- {e}" for e in input_errors))
+    st.stop()
 
 
 # =============================================================================
