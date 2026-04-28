@@ -356,8 +356,14 @@ def apply_edgar_autofill():
 
 
 def on_ticker_change():
-    """Streamlit callback fired when the ticker text_input loses focus / Enter."""
-    apply_edgar_autofill()
+    """Streamlit callback fired when the ticker text_input commits.
+    Only auto-fetch if the ticker actually changed since last load — avoids
+    a wasted EDGAR call when the user just tabs through the field.
+    """
+    cur = (st.session_state.get("ticker") or "").strip().upper()
+    loaded = (st.session_state.get("loaded_ticker") or "").strip().upper()
+    if cur and cur != loaded:
+        apply_edgar_autofill()
 
 
 # =============================================================================
@@ -859,12 +865,15 @@ st.latex(r"\text{NOPAT}_t = \text{EBIT}_t \times (1 - \text{tax rate})")
 st.latex(r"\text{FCF}_t = \text{NOPAT}_t \times (1 - \text{reinvestment rate})")
 
 proj_df = pd.DataFrame({
-    "Year":         list(range(1, years + 1)),
-    "Revenue ($M)": [f"{x:,.0f}" for x in dcf["revenues"]],
-    "EBIT ($M)":    [f"{x:,.0f}" for x in dcf["ebits"]],
-    "NOPAT ($M)":   [f"{x:,.0f}" for x in dcf["nopats"]],
-    "Reinvest ($M)":[f"{x:,.0f}" for x in dcf["reinvs"]],
-    "FCF ($M)":     [f"{x:,.0f}" for x in dcf["fcfs"]],
+    "Year":           list(range(1, years + 1)),
+    "Growth":         [f"{g*100:.2f}%" for g in dcf["growth_path"]],
+    "Margin":         [f"{m*100:.2f}%" for m in dcf["margin_path"]],
+    "Revenue ($M)":   [f"{x:,.0f}" for x in dcf["revenues"]],
+    "EBIT ($M)":      [f"{x:,.0f}" for x in dcf["ebits"]],
+    "NOPAT ($M)":     [f"{x:,.0f}" for x in dcf["nopats"]],
+    "Reinvest ($M)":  [f"{x:,.0f}" for x in dcf["reinvs"]],
+    "Δ NWC ($M)":     [f"{x:,.0f}" for x in dcf["nwcs"]],
+    "FCF ($M)":       [f"{x:,.0f}" for x in dcf["fcfs"]],
 })
 st.dataframe(proj_df, hide_index=True, use_container_width=True)
 
@@ -1065,8 +1074,15 @@ st.caption(
 )
 
 def build_excel_workbook():
+    """Build a fully editable Excel workbook that mirrors the live app's DCF.
+
+    Reflects all active modeling settings: per-year growth & margin paths
+    (from constant / 3-stage / linear-expansion modes), CAPM WACC build-up,
+    Gordon Growth vs Exit Multiple terminal value, mid-year discounting,
+    and ΔNWC drag. Edit any input on the Inputs sheet → projection auto-recalcs.
+    """
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.styles import Font, PatternFill
 
     wb = Workbook()
 
@@ -1076,90 +1092,151 @@ def build_excel_workbook():
     bold = Font(bold=True)
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF")
-    border_thin = Border(*[Side(style="thin", color="CCCCCC")] * 4)
+    italic_grey = Font(italic=True, color="666666")
 
+    # Single-value inputs (editable). Order matters — cell refs below use these row numbers.
     inputs = [
-        ("Company Name",         company_name,          ""),
-        ("Ticker",               ticker,                ""),
-        ("Current Revenue",      revenue,               "$M"),
-        ("Annual Growth Rate",   growth,                "(decimal)"),
-        ("EBIT Margin",          margin,                "(decimal)"),
-        ("Tax Rate",             tax_rate,              "(decimal)"),
-        ("Reinvestment Rate",    reinvest_rate,         "(decimal)"),
-        ("WACC",                 wacc,                  "(decimal)"),
-        ("Terminal Growth Rate", term_g,                "(decimal)"),
-        ("Forecast Years",       years,                 ""),
-        ("Total Debt",           debt,                  "$M"),
-        ("Cash & Equivalents",   cash,                  "$M"),
-        ("Shares Outstanding",   shares,                "millions"),
-        ("Current Stock Price",  price,                 "$"),
+        ("Company Name",                    company_name,        ""),                                  # 2
+        ("Ticker",                          ticker,              ""),                                  # 3
+        ("Current Revenue",                 revenue,             "$M"),                                # 4
+        ("Tax Rate",                        tax_rate,            "decimal"),                           # 5
+        ("Reinvestment Rate",               reinvest_rate,       "decimal"),                           # 6
+        ("WACC",                            wacc,                "decimal"),                           # 7
+        ("Terminal Growth Rate",            term_g,              "decimal"),                           # 8
+        ("Forecast Years",                  years,               ""),                                  # 9
+        ("Total Debt",                      debt,                "$M"),                                # 10
+        ("Cash & Equivalents",              cash,                "$M"),                                # 11
+        ("Shares Outstanding",              shares,              "millions"),                          # 12
+        ("Current Stock Price",             price,               "$"),                                 # 13
+        ("ΔNWC (% of Δrevenue)",            st.session_state.nwc_pct/100, "decimal"),                  # 14
+        ("Mid-year discounting (1=on)",     1 if st.session_state.mid_year else 0, ""),                # 15
+        ("TV method (0=Gordon, 1=ExitMul)", 1 if st.session_state.tv_method=="Exit Multiple" else 0,""),# 16
+        ("Exit EV/EBITDA Multiple",         st.session_state.exit_multiple, "x"),                      # 17
     ]
 
     ws["A1"] = "Input"; ws["B1"] = "Value"; ws["C1"] = "Unit"
     for c in ["A1", "B1", "C1"]:
-        ws[c].font = header_font
-        ws[c].fill = header_fill
+        ws[c].font = header_font; ws[c].fill = header_fill
     for i, (label, val, unit) in enumerate(inputs, start=2):
         ws.cell(row=i, column=1, value=label).font = bold
         ws.cell(row=i, column=2, value=val)
         ws.cell(row=i, column=3, value=unit)
-    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 16
-    ws.column_dimensions["C"].width = 14
+    ws.column_dimensions["C"].width = 12
 
-    # Named ranges that the DCF sheet references (1-indexed rows from `inputs`)
+    # Named cell references for downstream formulas
     REV_CELL    = "Inputs!$B$4"
-    GROWTH_CELL = "Inputs!$B$5"
-    MARGIN_CELL = "Inputs!$B$6"
-    TAX_CELL    = "Inputs!$B$7"
-    REINV_CELL  = "Inputs!$B$8"
-    WACC_CELL   = "Inputs!$B$9"
-    TG_CELL     = "Inputs!$B$10"
-    DEBT_CELL   = "Inputs!$B$12"
-    CASH_CELL   = "Inputs!$B$13"
-    SHARES_CELL = "Inputs!$B$14"
-    PRICE_CELL  = "Inputs!$B$15"
+    TAX_CELL    = "Inputs!$B$5"
+    REINV_CELL  = "Inputs!$B$6"
+    WACC_CELL   = "Inputs!$B$7"
+    TG_CELL     = "Inputs!$B$8"
+    DEBT_CELL   = "Inputs!$B$10"
+    CASH_CELL   = "Inputs!$B$11"
+    SHARES_CELL = "Inputs!$B$12"
+    PRICE_CELL  = "Inputs!$B$13"
+    NWC_CELL    = "Inputs!$B$14"
+    MIDYR_CELL  = "Inputs!$B$15"
+    TVMETH_CELL = "Inputs!$B$16"
+    EXITMULT_CELL = "Inputs!$B$17"
+
+    # ── Per-year growth + margin path table (editable; supports any modeling mode)
+    PATH_HEADER_ROW = 19
+    ws.cell(row=PATH_HEADER_ROW, column=1, value="Per-year Path (editable)").font = bold
+    ws.cell(row=PATH_HEADER_ROW, column=2, value="Growth Rate")
+    ws.cell(row=PATH_HEADER_ROW, column=3, value="EBIT Margin")
+    for c in range(1, 4):
+        ws.cell(row=PATH_HEADER_ROW, column=c).font = header_font
+        ws.cell(row=PATH_HEADER_ROW, column=c).fill = header_fill
+
+    for t in range(years):
+        r = PATH_HEADER_ROW + 1 + t
+        ws.cell(row=r, column=1, value=f"Year {t+1}").font = bold
+        ws.cell(row=r, column=2, value=growth_path[t]).number_format = "0.00%"
+        ws.cell(row=r, column=3, value=margin_path[t]).number_format = "0.00%"
+
+    PATH_FIRST_ROW = PATH_HEADER_ROW + 1  # row of Year 1 path
+
+    # Note rows below
+    note_row = PATH_FIRST_ROW + years + 1
+    ws.cell(row=note_row, column=1,
+        value=f"Modeling notes (active settings — change inputs above to override):").font = bold
+    notes = [
+        f"Growth mode:  {st.session_state.growth_mode}",
+        f"Margin mode:  {st.session_state.margin_mode}",
+        f"WACC mode:    {st.session_state.wacc_mode}"
+                + (f"  (Rf={st.session_state.rf:.2f}%, β={st.session_state.beta:.2f}, "
+                   f"ERP={st.session_state.erp:.2f}%, Rd={st.session_state.rd_pretax:.2f}%, "
+                   f"D/V={st.session_state.weight_debt:.0f}%)"
+                   if st.session_state.wacc_mode == "CAPM build-up" else ""),
+        f"TV method:    {st.session_state.tv_method}"
+                + (f"  ({st.session_state.exit_multiple:.1f}x EV/EBITDA)"
+                   if st.session_state.tv_method == "Exit Multiple" else ""),
+        f"Mid-year discounting: {'ON' if st.session_state.mid_year else 'OFF'}",
+        f"ΔNWC drag: {st.session_state.nwc_pct:.1f}% of Δrevenue",
+    ]
+    for i, n in enumerate(notes):
+        ws.cell(row=note_row+1+i, column=1, value=n).font = italic_grey
 
     # ─── DCF Projection sheet ────────────────────────────────────────────────
     ws2 = wb.create_sheet("DCF Projection")
-    headers = ["Year", "Revenue ($M)", "EBIT ($M)", "NOPAT ($M)", "Reinvestment ($M)",
-               "FCF ($M)", "Discount Factor", "PV of FCF ($M)"]
+    headers = ["Year", "Growth", "Margin", "Revenue ($M)", "EBIT ($M)", "NOPAT ($M)",
+               "Reinvest ($M)", "ΔNWC ($M)", "FCF ($M)", "Discount Factor", "PV of FCF ($M)"]
     for col, h in enumerate(headers, start=1):
         c = ws2.cell(row=1, column=col, value=h)
         c.font = header_font; c.fill = header_fill
 
-    # Year 0 (base year)
+    # Year 0 (base) — only Revenue is meaningful
     ws2.cell(row=2, column=1, value=0)
-    ws2.cell(row=2, column=2, value=f"={REV_CELL}")
+    ws2.cell(row=2, column=4, value=f"={REV_CELL}")
 
-    # Forecast years 1..N — every cell is a formula
+    # Forecast years 1..N — every cell is a formula referencing Inputs
     for t in range(1, years + 1):
         row = t + 2
+        # Path row in the Inputs sheet for this year:
+        path_row = PATH_FIRST_ROW + (t - 1)
         ws2.cell(row=row, column=1, value=t)
-        ws2.cell(row=row, column=2, value=f"=B{row-1}*(1+{GROWTH_CELL})")           # Revenue
-        ws2.cell(row=row, column=3, value=f"=B{row}*{MARGIN_CELL}")                  # EBIT
-        ws2.cell(row=row, column=4, value=f"=C{row}*(1-{TAX_CELL})")                 # NOPAT
-        ws2.cell(row=row, column=5, value=f"=D{row}*{REINV_CELL}")                   # Reinvestment
-        ws2.cell(row=row, column=6, value=f"=D{row}-E{row}")                         # FCF
-        ws2.cell(row=row, column=7, value=f"=1/(1+{WACC_CELL})^A{row}")              # Discount factor
-        ws2.cell(row=row, column=8, value=f"=F{row}*G{row}")                         # PV of FCF
+        ws2.cell(row=row, column=2, value=f"=Inputs!$B${path_row}")                    # Growth
+        ws2.cell(row=row, column=3, value=f"=Inputs!$C${path_row}")                    # Margin
+        ws2.cell(row=row, column=4, value=f"=D{row-1}*(1+B{row})")                     # Revenue
+        ws2.cell(row=row, column=5, value=f"=D{row}*C{row}")                           # EBIT
+        ws2.cell(row=row, column=6, value=f"=E{row}*(1-{TAX_CELL})")                   # NOPAT
+        ws2.cell(row=row, column=7, value=f"=F{row}*{REINV_CELL}")                     # Reinvestment
+        ws2.cell(row=row, column=8, value=f"=MAX(0,(D{row}-D{row-1})*{NWC_CELL})")     # ΔNWC
+        ws2.cell(row=row, column=9, value=f"=F{row}-G{row}-H{row}")                    # FCF
+        # Discount factor: end-year (1+W)^t  OR  mid-year (1+W)^(t-0.5)
+        ws2.cell(row=row, column=10,
+            value=f"=1/(1+{WACC_CELL})^(A{row}-0.5*{MIDYR_CELL})")                     # DF
+        ws2.cell(row=row, column=11, value=f"=I{row}*J{row}")                          # PV
 
     last_data_row = years + 2
 
     # Format numeric cells
     for r in range(2, last_data_row + 1):
-        for c in range(2, 7):
+        ws2.cell(row=r, column=2).number_format = "0.00%"
+        ws2.cell(row=r, column=3).number_format = "0.00%"
+        for c in range(4, 10):
             ws2.cell(row=r, column=c).number_format = "#,##0"
-        ws2.cell(row=r, column=7).number_format = "0.0000"
-        ws2.cell(row=r, column=8).number_format = "#,##0"
+        ws2.cell(row=r, column=10).number_format = "0.0000"
+        ws2.cell(row=r, column=11).number_format = "#,##0"
 
-    # ─── Valuation summary on same sheet ────────────────────────────────────
+    # ─── Valuation summary (same sheet) ─────────────────────────────────────
     summary_start = last_data_row + 3
+    # Compute the dual TV formula (Gordon vs Exit Multiple)
+    last_fcf_cell  = f"I{last_data_row}"
+    last_ebit_cell = f"E{last_data_row}"
+
     rows = [
-        ("Sum of PV of FCFs",      f"=SUM(H3:H{last_data_row})"),
-        ("Terminal FCF (Yr N+1)",  f"=F{last_data_row}*(1+{TG_CELL})"),
-        ("Terminal Value",         f"=B{summary_start+1}/({WACC_CELL}-{TG_CELL})"),
-        ("PV of Terminal Value",   f"=B{summary_start+2}/(1+{WACC_CELL})^{years}"),
+        ("Sum of PV of FCFs",      f"=SUM(K3:K{last_data_row})"),
+        ("Terminal FCF (Yr N+1)",  f"={last_fcf_cell}*(1+{TG_CELL})"),
+        # IF TV method = 1 (Exit Multiple): exit_multiple × EBITDA (≈ EBIT × 1.15)
+        # ELSE Gordon Growth: terminal_FCF / (WACC − g)
+        ("Terminal Value",
+            f"=IF({TVMETH_CELL}=1,"
+            f"{EXITMULT_CELL}*{last_ebit_cell}*1.15,"
+            f"B{summary_start+1}/({WACC_CELL}-{TG_CELL}))"),
+        ("PV of Terminal Value",
+            f"=B{summary_start+2}/(1+{WACC_CELL})^({years}-0.5*{MIDYR_CELL})"),
         ("Enterprise Value",       f"=B{summary_start}+B{summary_start+3}"),
         ("(−) Total Debt",         f"=-{DEBT_CELL}"),
         ("(+) Cash & Equivalents", f"={CASH_CELL}"),
@@ -1183,8 +1260,8 @@ def build_excel_workbook():
     ws2.cell(row=summary_start + 9, column=2).font = Font(bold=True, color="1F4E79", size=12)
 
     ws2.column_dimensions["A"].width = 26
-    for col_letter in ["B", "C", "D", "E", "F", "G", "H"]:
-        ws2.column_dimensions[col_letter].width = 16
+    for col_letter in ["B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]:
+        ws2.column_dimensions[col_letter].width = 14
 
     # ─── Sensitivity sheet ────────────────────────────────────────────────────
     ws3 = wb.create_sheet("Sensitivity")
@@ -1219,23 +1296,32 @@ def build_excel_workbook():
     # ─── README / methodology sheet ──────────────────────────────────────────
     ws4 = wb.create_sheet("Methodology")
     notes = [
-        "DCF Equity Valuation — Replication",
+        "DCF Equity Valuation — Excel Replication",
         "",
         f"Company: {company_name} ({ticker})",
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         "",
         "Sheets:",
-        "  1. Inputs — all assumptions, editable",
-        "  2. DCF Projection — year-by-year forecast + valuation summary (formulas)",
-        "  3. Sensitivity — WACC × Terminal growth grid",
+        "  1. Inputs — all assumptions + per-year growth/margin path (editable)",
+        "  2. DCF Projection — year-by-year forecast + valuation summary (live formulas)",
+        "  3. Sensitivity — WACC × Terminal growth grid (computed values)",
+        "",
+        "Active modeling settings (snapshot from app — see 'Modeling notes' on Inputs sheet):",
+        f"  • Growth path:    {st.session_state.growth_mode}",
+        f"  • Margin path:    {st.session_state.margin_mode}",
+        f"  • WACC mode:      {st.session_state.wacc_mode} (resolved to {wacc*100:.2f}%)",
+        f"  • Terminal value: {st.session_state.tv_method}",
+        f"  • Discounting:    {'Mid-year' if st.session_state.mid_year else 'End-of-year'}",
+        f"  • ΔNWC drag:      {st.session_state.nwc_pct:.1f}% of revenue change",
         "",
         "How to use:",
-        "  • Edit any cell in 'Inputs' — the projection updates automatically.",
-        "  • Compare cell B(N+12) on DCF Projection (Intrinsic Value) to B(N+13) (Market Price).",
-        "  • Sensitivity table shows how the valuation moves with discount-rate / terminal-growth assumptions.",
+        "  • Edit any cell in 'Inputs' — the DCF Projection sheet recomputes automatically.",
+        "  • Per-year growth/margin in the Inputs sheet (rows 20+) are the actual rates the model used,",
+        "    derived from your modeling-mode choice. Override any year independently to stress-test.",
+        "  • Compare 'DCF Intrinsic Value' to 'Current Market Price' on the projection sheet.",
+        "  • Sensitivity sheet shows how valuation moves with WACC × terminal-growth.",
         "",
-        "Data source: SEC EDGAR 10-K filings (when 'Auto-fill' was used).",
-        "Model: 5-step DCF — forecast FCF → discount → terminal value → enterprise value → equity value → per share.",
+        "Data source: SEC EDGAR 10-K filings (when 'Auto-fill from EDGAR' was used in the app).",
     ]
     for i, line in enumerate(notes, start=1):
         c = ws4.cell(row=i, column=1, value=line)
