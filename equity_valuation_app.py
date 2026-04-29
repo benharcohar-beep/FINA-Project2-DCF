@@ -340,11 +340,23 @@ def apply_edgar_autofill():
             "or enter values manually below.")
         return
 
+    # Slider bounds for keys that are bound to sliders. If EDGAR returns a value
+    # outside these bounds (e.g. NVDA's ~68% revenue CAGR vs. growth slider max),
+    # writing it raw into session_state crashes Streamlit when the slider re-renders.
+    # Clamp here so the app stays alive; the user can still adjust manually.
+    SLIDER_BOUNDS = {
+        "growth": (-20.0, 100.0),
+        "margin": (0.0, 100.0),
+    }
+
     def _set(key, val, min_val=0):
         if val is None: return
         try: v = float(val)
         except (TypeError, ValueError): return
         if v <= min_val: return
+        if key in SLIDER_BOUNDS:
+            lo, hi = SLIDER_BOUNDS[key]
+            v = max(lo, min(hi, v))
         st.session_state[key] = round(v, 1) if isinstance(v, float) and abs(v) < 1000 else round(v)
 
     if edgar.get("name"):
@@ -492,9 +504,10 @@ with st.sidebar:
              help="Constant = same growth rate every year. 3-stage = high-growth period, then linear fade, then stable terminal.")
 
     if st.session_state.growth_mode == "Constant":
-        st.slider("Annual Growth Rate (%)", min_value=-20.0, max_value=50.0, step=0.5, key="growth",
+        st.slider("Annual Growth Rate (%)", min_value=-20.0, max_value=100.0, step=0.5, key="growth",
                   format="%.1f%%",
-                  help="Revenue growth during the forecast period. EDGAR fills with 3-yr CAGR.")
+                  help="Revenue growth during the forecast period. EDGAR fills with 3-yr CAGR. "
+                       "If >50% sustained, prefer 3-stage growth — perpetual high growth is rarely realistic.")
     else:
         st.slider("High-growth Rate (%)", min_value=-10.0, max_value=80.0, step=0.5,
                   key="high_growth", format="%.1f%%",
