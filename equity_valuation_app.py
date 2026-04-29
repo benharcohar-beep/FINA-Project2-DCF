@@ -34,35 +34,48 @@ st.caption("Discounted Cash Flow valuation tool with SEC filings auto-fill and E
 # Uses the official SEC API: free, no key, not rate-limited beyond UA requirement.
 # =============================================================================
 _SEC_HEADERS = {
-    "User-Agent": "DCF-Valuation-App contact@dcf-app.local",
+    "User-Agent": "FINA Project2 DCF Valuation benharcohar@gmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _ticker_to_cik(symbol: str):
-    """Map ticker → 10-digit CIK + company name. Cached for a day.
+# Sentinel returned by EDGAR helpers to distinguish "the SEC API blocked / failed
+# us right now" (transient, retryable) from "this ticker truly isn't in EDGAR"
+# (permanent for this symbol). The app surfaces different messages for each.
+_FETCH_FAILED = object()
 
-    SEC normalises tickers using hyphens for share classes (BRK-B, BRK-A) but
-    users commonly type them with dots (BRK.B). Try a few variants.
+@st.cache_data(ttl=86400, show_spinner=False)
+def _ticker_to_cik_cached(symbol: str):
+    """Cached path — only stores successful (cik, name) tuples."""
+    sym_u = symbol.upper().strip()
+    variants = {sym_u, sym_u.replace(".", "-"), sym_u.replace("-", "."), sym_u.replace(".", "")}
+    r = requests.get(
+        "https://www.sec.gov/files/company_tickers.json",
+        headers={"User-Agent": _SEC_HEADERS["User-Agent"]},
+        timeout=10,
+    )
+    r.raise_for_status()
+    for entry in r.json().values():
+        if entry.get("ticker", "").upper() in variants:
+            return str(entry["cik_str"]).zfill(10), entry.get("title", symbol)
+    return None, None  # ticker genuinely not in SEC index → safe to cache
+
+
+def _ticker_to_cik(symbol: str):
+    """Map ticker → 10-digit CIK + company name.
+
+    Returns:
+        (cik, name)  on success
+        (None, None) when the ticker isn't in EDGAR's index (cached for a day)
+        _FETCH_FAILED when the SEC blocked/timed out (NOT cached, retry on next call)
     """
     if not symbol:
         return None, None
-    sym_u = symbol.upper().strip()
-    variants = {sym_u, sym_u.replace(".", "-"), sym_u.replace("-", "."), sym_u.replace(".", "")}
     try:
-        r = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
-            headers={"User-Agent": _SEC_HEADERS["User-Agent"]},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return None, None
-        for entry in r.json().values():
-            if entry.get("ticker", "").upper() in variants:
-                return str(entry["cik_str"]).zfill(10), entry.get("title", symbol)
+        return _ticker_to_cik_cached(symbol)
     except Exception:
-        pass
-    return None, None
+        # Transient failure — the @st.cache_data decorator does not cache exceptions,
+        # so the next call will retry instead of getting a stale "not found".
+        return _FETCH_FAILED
 
 
 def _latest_annual(facts_block):
@@ -136,98 +149,104 @@ def _best_concept(us_gaap, *names):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_edgar_cached(symbol: str):
+    """Cached path — only stores successful dicts and definitive 'not found' (None)."""
+    cik, name = _ticker_to_cik_cached(symbol)
+    if cik is None:
+        return None  # genuinely unknown ticker — OK to cache
+    r = requests.get(
+        f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+        headers={**_SEC_HEADERS, "Host": "data.sec.gov"},
+        timeout=15,
+    )
+    r.raise_for_status()  # any non-200 → exception → not cached, will retry
+    ug = r.json().get("facts", {}).get("us-gaap", {}) or {}
+    dei = r.json().get("facts", {}).get("dei", {}) or {}
+    # Combined namespace lookup for shares (dei + us-gaap — companies use either)
+    all_facts = {**ug, **dei}
+
+    rev,    rev_hist = _latest_annual(_best_concept(ug,
+        "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"))
+    # Operating income — use NetIncomeLoss as fallback for banks/insurers that don't report OpIncLoss
+    opinc,  _        = _latest_annual(_best_concept(ug,
+        "OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"))
+    net_inc, _       = _latest_annual(_best_concept(ug, "NetIncomeLoss",
+        "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"))
+    ocf,    _        = _latest_annual(_best_concept(ug,
+        "NetCashProvidedByUsedInOperatingActivities"))
+    capex,  _        = _latest_annual(_best_concept(ug,
+        "PaymentsToAcquirePropertyPlantAndEquipment",
+        "PaymentsToAcquireProductiveAssets"))
+    cash,   _        = _latest_annual(_best_concept(ug,
+        "CashAndCashEquivalentsAtCarryingValue",
+        "Cash",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"))
+    dlt,    _        = _latest_annual(_best_concept(ug,
+        "LongTermDebt", "LongTermDebtNoncurrent"))
+    dst,    _        = _latest_annual(_best_concept(ug,
+        "LongTermDebtCurrent", "DebtCurrent",
+        "ShortTermBorrowings"))
+    # Shares: try multiple tags across BOTH dei and us-gaap. Prefer diluted weighted-avg
+    # (standard for per-share metrics), fall back to common shares outstanding.
+    shares, _        = _latest_annual(_best_concept(all_facts,
+        "WeightedAverageNumberOfDilutedSharesOutstanding",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "CommonStockSharesOutstanding",
+        "EntityCommonStockSharesOutstanding"))
+
+    # EBIT margin: prefer real EBIT, else estimate from net income (assume 21% effective tax)
+    ebit_margin = None
+    if opinc and rev and opinc > 0:
+        ebit_margin = opinc / rev
+    elif net_inc and rev and net_inc > 0:
+        ebit_margin = (net_inc / 0.79) / rev
+
+    revenue_cagr = None
+    if rev_hist and len(rev_hist) >= 2:
+        n_years = min(len(rev_hist) - 1, 4)
+        oldest = rev_hist[n_years][1]
+        latest = rev_hist[0][1]
+        if oldest > 0 and n_years > 0:
+            revenue_cagr = (latest / oldest) ** (1 / n_years) - 1
+
+    missing = []
+    if not rev:        missing.append("Revenue")
+    if not shares:     missing.append("Shares Outstanding")
+    if ebit_margin is None: missing.append("EBIT Margin")
+    if cash is None:   missing.append("Cash")
+    if not (dlt or dst): missing.append("Debt")
+
+    return {
+        "name":          name,
+        "revenue":       rev / 1e6 if rev else None,
+        "ebit_margin":   ebit_margin * 100 if ebit_margin else None,
+        "operating_cf":  ocf / 1e6 if ocf else None,
+        "capex":         capex / 1e6 if capex else None,
+        "cash":          cash / 1e6 if cash else None,
+        "debt":          ((dlt or 0) + (dst or 0)) / 1e6 if (dlt or dst) else None,
+        "shares":        shares / 1e6 if shares else None,
+        "revenue_cagr":  revenue_cagr * 100 if revenue_cagr else None,
+        "rev_history":   [(y, v / 1e9) for y, v in rev_hist[:5]],
+        "fy_end":        rev_hist[0][0] if rev_hist else None,
+        "missing":       missing,
+    }
+
+
 def fetch_edgar_fundamentals(symbol: str):
     """Pull fundamentals from SEC EDGAR Company Facts API.
-    Returns dict of latest annual values, or None on failure."""
-    try:
-        cik, name = _ticker_to_cik(symbol)
-        if cik is None:
-            return None
-        r = requests.get(
-            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
-            headers={**_SEC_HEADERS, "Host": "data.sec.gov"},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            return None
-        ug = r.json().get("facts", {}).get("us-gaap", {}) or {}
-        dei = r.json().get("facts", {}).get("dei", {}) or {}
-        # Combined namespace lookup for shares (dei + us-gaap — companies use either)
-        all_facts = {**ug, **dei}
 
-        rev,    rev_hist = _latest_annual(_best_concept(ug,
-            "Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
-            "SalesRevenueNet", "RevenueFromContractWithCustomerIncludingAssessedTax"))
-        # Operating income — use NetIncomeLoss as fallback for banks/insurers that don't report OpIncLoss
-        opinc,  _        = _latest_annual(_best_concept(ug,
-            "OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"))
-        net_inc, _       = _latest_annual(_best_concept(ug, "NetIncomeLoss",
-            "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"))
-        ocf,    _        = _latest_annual(_best_concept(ug,
-            "NetCashProvidedByUsedInOperatingActivities"))
-        capex,  _        = _latest_annual(_best_concept(ug,
-            "PaymentsToAcquirePropertyPlantAndEquipment",
-            "PaymentsToAcquireProductiveAssets"))
-        cash,   _        = _latest_annual(_best_concept(ug,
-            "CashAndCashEquivalentsAtCarryingValue",
-            "Cash",
-            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"))
-        dlt,    _        = _latest_annual(_best_concept(ug,
-            "LongTermDebt", "LongTermDebtNoncurrent"))
-        dst,    _        = _latest_annual(_best_concept(ug,
-            "LongTermDebtCurrent", "DebtCurrent",
-            "ShortTermBorrowings"))
-        # Shares: try multiple tags across BOTH dei and us-gaap. Prefer diluted weighted-avg
-        # (standard for per-share metrics), fall back to common shares outstanding.
-        shares, _        = _latest_annual(_best_concept(all_facts,
-            "WeightedAverageNumberOfDilutedSharesOutstanding",
-            "WeightedAverageNumberOfSharesOutstandingBasic",
-            "CommonStockSharesOutstanding",
-            "EntityCommonStockSharesOutstanding"))
-
-        # ── Derived metrics ───────────────────────────────────────────────
-        # EBIT margin: prefer real EBIT, else estimate from net income (assume 21% effective tax)
-        ebit_margin = None
-        if opinc and rev and opinc > 0:
-            ebit_margin = opinc / rev
-        elif net_inc and rev and net_inc > 0:
-            # Net income → pre-tax estimate (gross-up by 1/(1-0.21))
-            ebit_margin = (net_inc / 0.79) / rev
-
-        # Revenue CAGR over available history (uses up to 4-yr window for stability)
-        revenue_cagr = None
-        if rev_hist and len(rev_hist) >= 2:
-            n_years = min(len(rev_hist) - 1, 4)
-            oldest = rev_hist[n_years][1]
-            latest = rev_hist[0][1]
-            if oldest > 0 and n_years > 0:
-                revenue_cagr = (latest / oldest) ** (1 / n_years) - 1
-
-        # Track which fields couldn't be resolved — surface to user so they
-        # know which inputs to set manually instead of trusting a silent zero.
-        missing = []
-        if not rev:        missing.append("Revenue")
-        if not shares:     missing.append("Shares Outstanding")
-        if ebit_margin is None: missing.append("EBIT Margin")
-        if cash is None:   missing.append("Cash")
-        if not (dlt or dst): missing.append("Debt")
-
-        return {
-            "name":          name,
-            "revenue":       rev / 1e6 if rev else None,
-            "ebit_margin":   ebit_margin * 100 if ebit_margin else None,
-            "operating_cf":  ocf / 1e6 if ocf else None,
-            "capex":         capex / 1e6 if capex else None,
-            "cash":          cash / 1e6 if cash else None,
-            "debt":          ((dlt or 0) + (dst or 0)) / 1e6 if (dlt or dst) else None,
-            "shares":        shares / 1e6 if shares else None,
-            "revenue_cagr":  revenue_cagr * 100 if revenue_cagr else None,
-            "rev_history":   [(y, v / 1e9) for y, v in rev_hist[:5]],
-            "fy_end":        rev_hist[0][0] if rev_hist else None,
-            "missing":       missing,
-        }
-    except Exception:
+    Returns:
+        dict          — fundamentals on success
+        None          — ticker confirmed not in EDGAR (cached for 1h)
+        _FETCH_FAILED — SEC API blocked/timed out (NOT cached, retry on next call)
+    """
+    if not symbol:
         return None
+    try:
+        return _fetch_edgar_cached(symbol)
+    except Exception:
+        return _FETCH_FAILED
 
 
 # =============================================================================
@@ -300,7 +319,13 @@ def apply_edgar_autofill():
     if not sym:
         return
     edgar = fetch_edgar_fundamentals(sym)
-    if not edgar:
+    if edgar is _FETCH_FAILED:
+        st.session_state.edgar_msg = ("error",
+            f"⚠️ Couldn't reach SEC EDGAR right now (server returned an error or timed out). "
+            f"This is usually transient — wait a few seconds and click **🔄 Refresh** to retry. "
+            f"You can keep editing manual inputs below in the meantime.")
+        return
+    if edgar is None:
         st.session_state.edgar_msg = ("error",
             f"❌ Ticker **{sym}** not found in EDGAR. Use a US-listed ticker, "
             "or enter values manually below.")
