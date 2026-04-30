@@ -445,17 +445,14 @@ with st.sidebar:
             f"Press Enter or click 'Re-fetch from EDGAR' to load **{cur}**."
         )
 
-    st.text_input("Company Name", key="company_name")
+    # Company Name and Current Revenue widgets intentionally hidden — the
+    # values are populated by EDGAR autofill (or DEFAULTS) and flow into the
+    # DCF math from session_state. The customer doesn't see the raw values.
 
     st.markdown("---")
 
     # ─── Financial inputs ────────────────────────────────────────────────────
     st.subheader("💰 Financial Inputs")
-    st.caption("All dollar values in millions ($M)")
-
-    # Dollar amounts stay as number_input — sliders are too imprecise for $100B+
-    st.number_input("Current Revenue ($M)", min_value=0.0, step=100.0, key="revenue",
-                    help="Most recent annual revenue. EDGAR fills with latest 10-K value.")
 
     # ── Margin: simple slider, with optional linear-expansion mode ──
     st.radio("Margin assumption", options=["Constant", "Linear expansion"],
@@ -585,23 +582,12 @@ with st.sidebar:
                   help="If intrinsic value is within ±this band of market price, verdict says 'Fairly Valued'. "
                        "Outside the band: 'Undervalued' or 'Overvalued'.")
 
-    st.markdown("---")
-
-    # ─── Capital structure ───────────────────────────────────────────────────
-    st.subheader("⚖️ Capital Structure")
-    st.number_input("Total Debt ($M)", min_value=0.0, step=100.0, key="debt",
-                    help="Long-term + short-term debt from balance sheet.")
-    st.number_input("Cash & Equivalents ($M)", min_value=0.0, step=100.0, key="cash",
-                    help="Cash + marketable securities. Subtracted from EV → equity value.")
-    st.number_input("Shares Outstanding (millions)", min_value=0.1, step=10.0, key="shares",
-                    help="Diluted share count for per-share value.")
-
-    st.markdown("---")
-
-    # ─── Market reference ────────────────────────────────────────────────────
-    st.subheader("📊 Market Reference")
-    st.number_input("Current Stock Price ($)", min_value=0.01, step=0.50, key="current_price",
-                    help="Today's market price. Look it up on Google Finance and paste here.")
+    # Capital Structure (Total Debt, Cash & Equivalents, Shares Outstanding)
+    # and Market Reference (Current Stock Price) widgets intentionally hidden.
+    # debt/cash/shares are populated by EDGAR autofill on ticker change;
+    # current_price keeps its DEFAULTS fallback. All four flow into the DCF
+    # math from session_state so the customer sees the valuation, not the
+    # raw inputs.
 
 
 # =============================================================================
