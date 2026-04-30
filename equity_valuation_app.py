@@ -178,22 +178,31 @@ def _fetch_edgar_cached(symbol: str):
     capex,  _        = _latest_annual(_best_concept(ug,
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets"))
-    cash,   _        = _latest_annual(_best_concept(ug,
+    cash,   cash_hist = _latest_annual(_best_concept(ug,
         "CashAndCashEquivalentsAtCarryingValue",
         "Cash",
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"))
-    dlt,    _        = _latest_annual(_best_concept(ug,
+    dlt,    dlt_hist  = _latest_annual(_best_concept(ug,
         "LongTermDebt", "LongTermDebtNoncurrent"))
-    dst,    _        = _latest_annual(_best_concept(ug,
+    dst,    dst_hist  = _latest_annual(_best_concept(ug,
         "LongTermDebtCurrent", "DebtCurrent",
         "ShortTermBorrowings"))
     # Shares: try multiple tags across BOTH dei and us-gaap. Prefer diluted weighted-avg
     # (standard for per-share metrics), fall back to common shares outstanding.
-    shares, _        = _latest_annual(_best_concept(all_facts,
+    shares, shares_hist = _latest_annual(_best_concept(all_facts,
         "WeightedAverageNumberOfDilutedSharesOutstanding",
         "WeightedAverageNumberOfSharesOutstandingBasic",
         "CommonStockSharesOutstanding",
         "EntityCommonStockSharesOutstanding"))
+
+    # Combine long+short term debt year-by-year for total-debt history
+    dlt_by_y = {y: v for y, v in dlt_hist}
+    dst_by_y = {y: v for y, v in dst_hist}
+    debt_hist = sorted(
+        ((y, dlt_by_y.get(y, 0) + dst_by_y.get(y, 0))
+         for y in set(dlt_by_y) | set(dst_by_y)),
+        key=lambda x: -x[0],
+    )
 
     # EBIT margin: prefer real EBIT, else estimate from net income (assume 21% effective tax)
     ebit_margin = None
@@ -228,6 +237,9 @@ def _fetch_edgar_cached(symbol: str):
         "shares":        shares / 1e6 if shares else None,
         "revenue_cagr":  revenue_cagr * 100 if revenue_cagr else None,
         "rev_history":   [(y, v / 1e9) for y, v in rev_hist[:5]],
+        "debt_history":  [(y, v / 1e6) for y, v in debt_hist[:5]],
+        "cash_history":  [(y, v / 1e6) for y, v in cash_hist[:5]],
+        "shares_history":[(y, v / 1e6) for y, v in shares_hist[:5]],
         "fy_end":        rev_hist[0][0] if rev_hist else None,
         "missing":       missing,
     }
@@ -263,10 +275,9 @@ DEFAULTS = {
     "wacc":            8.5,        # % — large-cap blue chip
     "terminal_growth": 2.5,        # %
     "years":           5,
-    "debt":            107000.0,   # $M
-    "cash":            65000.0,    # $M
-    "shares":          15300.0,    # millions
-    "current_price":   210.00,     # $
+    # debt / cash / shares / current_price intentionally NOT defaulted —
+    # the customer fills them in themselves using the historical norms shown
+    # in each field's tooltip as guidance.
     "edgar_data":      None,
     "loaded_ticker":   "AAPL",
     "edgar_msg":       None,
@@ -363,12 +374,11 @@ def apply_edgar_autofill():
         st.session_state.company_name = edgar["name"]
     _set("revenue", edgar.get("revenue"))
     _set("margin",  edgar.get("ebit_margin"))
-    _set("shares",  edgar.get("shares"))
     _set("growth",  edgar.get("revenue_cagr"))
-    if edgar.get("cash") is not None and edgar.get("cash") >= 0:
-        st.session_state.cash = round(edgar["cash"], 0)
-    if edgar.get("debt") is not None and edgar.get("debt") >= 0:
-        st.session_state.debt = round(edgar["debt"], 0)
+    # Note: shares / cash / debt are intentionally NOT auto-populated.
+    # The customer enters them themselves using the historical norms shown
+    # in each input's tooltip ("?" icon). EDGAR data is preserved in
+    # session_state.edgar_data for the tooltip to render from.
     if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
         nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
         if nopat > 0:
@@ -588,20 +598,50 @@ with st.sidebar:
     st.markdown("---")
 
     # ─── Capital structure ───────────────────────────────────────────────────
+    # Tooltips show historical norms from EDGAR for the loaded ticker so the
+    # customer has a reference point without us pre-filling the field.
+    def _historical_help(field_label: str, history: list, units: str, base_help: str) -> str:
+        """Build help text combining base guidance with historical EDGAR data.
+        history is a list of (year, value) tuples sorted newest-first."""
+        if not history:
+            return base_help
+        lo = min(v for _, v in history)
+        hi = max(v for _, v in history)
+        avg = sum(v for _, v in history) / len(history)
+        latest_y, latest_v = history[0]
+        co = (st.session_state.get("edgar_data") or {}).get("name", "this company")
+        per_year = " · ".join(f"FY{y}: {v:,.0f}" for y, v in history)
+        return (
+            f"{base_help}\n\n"
+            f"**{co} historical {field_label.lower()}** ({units}):\n"
+            f"- Latest (FY{latest_y}): **{latest_v:,.0f}**\n"
+            f"- {len(history)}-yr range: {lo:,.0f} – {hi:,.0f}  ·  avg {avg:,.0f}\n"
+            f"- Per year: {per_year}"
+        )
+
+    edata = st.session_state.get("edgar_data") or {}
     st.subheader("⚖️ Capital Structure")
-    st.number_input("Total Debt ($M)", min_value=0.0, step=100.0, key="debt",
-                    help="Long-term + short-term debt from balance sheet.")
-    st.number_input("Cash & Equivalents ($M)", min_value=0.0, step=100.0, key="cash",
-                    help="Cash + marketable securities. Subtracted from EV → equity value.")
-    st.number_input("Shares Outstanding (millions)", min_value=0.1, step=10.0, key="shares",
-                    help="Diluted share count for per-share value.")
+    st.number_input("Total Debt ($M)", min_value=0.0, step=100.0, key="debt", value=None,
+                    placeholder="Enter total debt in $M",
+                    help=_historical_help("Total Debt", edata.get("debt_history", []), "$M",
+                        "Long-term + short-term debt from balance sheet."))
+    st.number_input("Cash & Equivalents ($M)", min_value=0.0, step=100.0, key="cash", value=None,
+                    placeholder="Enter cash in $M",
+                    help=_historical_help("Cash & Equivalents", edata.get("cash_history", []), "$M",
+                        "Cash + marketable securities. Subtracted from EV → equity value."))
+    st.number_input("Shares Outstanding (millions)", min_value=0.1, step=10.0, key="shares", value=None,
+                    placeholder="Enter share count in millions",
+                    help=_historical_help("Shares Outstanding", edata.get("shares_history", []), "M",
+                        "Diluted share count for per-share value."))
 
     st.markdown("---")
 
     # ─── Market reference ────────────────────────────────────────────────────
     st.subheader("📊 Market Reference")
-    st.number_input("Current Stock Price ($)", min_value=0.01, step=0.50, key="current_price",
-                    help="Today's market price. Look it up on Google Finance and paste here.")
+    st.number_input("Current Stock Price ($)", min_value=0.01, step=0.50, key="current_price", value=None,
+                    placeholder="Enter today's price",
+                    help="Today's market price. Look it up on Google Finance and paste here. "
+                         "EDGAR doesn't carry real-time prices, so this one's on you.")
 
 
 # =============================================================================
@@ -616,10 +656,15 @@ tax_rate      = float(st.session_state.tax_rate) / 100
 reinvest_rate = float(st.session_state.reinvest_rate) / 100
 term_g        = float(st.session_state.terminal_growth) / 100
 years         = int(st.session_state.years)
-debt          = float(st.session_state.debt)
-cash          = float(st.session_state.cash)
-shares        = max(float(st.session_state.shares), 0.1)  # never zero (divide guard)
-price         = max(float(st.session_state.current_price), 0.01)
+def _opt_float(key, default=0.0):
+    """Read an optional number_input — returns default when the field is empty (None)."""
+    v = st.session_state.get(key)
+    return float(v) if v is not None else default
+
+debt          = _opt_float("debt", 0.0)
+cash          = _opt_float("cash", 0.0)
+shares        = max(_opt_float("shares", 0.1), 0.1)  # never zero (divide guard)
+price         = max(_opt_float("current_price", 0.01), 0.01)
 
 # Resolve WACC (direct entry OR CAPM build-up) BEFORE validation
 cost_equity = after_tax_rd = None
@@ -776,8 +821,12 @@ if wacc <= term_g:
         f"WACC ({wacc*100:.2f}%) must be greater than Terminal Growth ({term_g*100:.2f}%) — "
         "otherwise the Gordon Growth formula explodes to infinity."
     )
-if shares <= 0:
+if st.session_state.get("shares") in (None, 0, 0.0):
+    input_errors.append("Shares Outstanding is empty — fill it in (the tooltip shows historical norms).")
+elif shares <= 0:
     input_errors.append("Shares Outstanding must be > 0.")
+if st.session_state.get("current_price") in (None, 0, 0.0):
+    input_errors.append("Current Stock Price is empty — fill it in (look it up on Google Finance).")
 if input_errors:
     st.error("⚠️ **Cannot run DCF — please fix these inputs first:**\n\n" +
              "\n".join(f"- {e}" for e in input_errors))
