@@ -460,22 +460,35 @@ with st.sidebar:
              help="Constant = flat EBIT margin every year. Linear expansion = margin moves linearly from Year 1 to Year N (good for growth firms with operating leverage).")
     st.slider("EBIT Margin (Year 1) (%)", min_value=0.0, max_value=100.0, step=0.5, key="margin",
               format="%.1f%%",
-              help="Operating Income ÷ Revenue. Higher margin → more value. EDGAR auto-fills from 10-K.")
+              help="Operating Income ÷ Revenue. Higher margin → more value. EDGAR auto-fills from 10-K.\n\n"
+                  "**Recommended:** depends heavily on industry. Software/tech: 25-40%. Pharma: 20-30%. "
+                  "Banks/insurers: 25-35%. Consumer staples: 15-25%. Retail/grocers: 3-8%. Airlines/auto: 5-12%. "
+                  "Use the EDGAR-loaded value as your baseline.")
     if st.session_state.margin_mode == "Linear expansion":
         st.slider("Terminal EBIT Margin (Year N) (%)", min_value=0.0, max_value=100.0, step=0.5,
                   key="margin_terminal", format="%.1f%%",
-                  help="Margin in the final forecast year. Linear interpolation between Year 1 and Year N.")
+                  help="Margin in the final forecast year. Linear interpolation between Year 1 and Year N.\n\n"
+                       "**Recommended:** for growth firms with operating leverage, terminal margin is typically "
+                       "3-10 percentage points above Year 1. For mature firms, set roughly equal to Year 1.")
 
     st.slider("Tax Rate (%)", min_value=0.0, max_value=50.0, step=0.5, key="tax_rate",
               format="%.1f%%",
-              help="Effective corporate tax rate. US federal statutory is 21%; effective often 15-25%.")
+              help="Effective corporate tax rate. US federal statutory is 21%; effective often 15-25%.\n\n"
+                   "**Recommended:** **21%** for US federal-only. **25%** for US federal + average state tax. "
+                   "Most large-cap US filers run **18-22%** effective. Multinationals with foreign-income shields "
+                   "(AAPL, MSFT) often **13-18%**. Use the company's last 10-K effective rate as a baseline.")
     st.slider("Reinvestment Rate (%)", min_value=0.0, max_value=100.0, step=1.0, key="reinvest_rate",
               format="%.0f%%",
-              help="% of NOPAT reinvested in CapEx + working capital. Higher → less FCF today, more future growth.")
+              help="% of NOPAT reinvested in CapEx + working capital. Higher → less FCF today, more future growth.\n\n"
+                   "**Recommended:** mature/cash-cow firms (AAPL, KO, JNJ): **10-25%**. "
+                   "Steady growth: **25-40%**. High growth/capital-heavy (TSLA, NVDA, semis, telecoms): **40-70%**. "
+                   "Rule of thumb: reinvestment ≈ growth ÷ ROIC.")
 
     st.slider("Δ Working Capital (% of Δ Revenue)", min_value=0.0, max_value=30.0, step=0.5,
               key="nwc_pct", format="%.1f%%",
-              help="Net working capital tied up per dollar of revenue growth. Subtracted from FCF. Typical 1-5%.")
+              help="Net working capital tied up per dollar of revenue growth. Subtracted from FCF.\n\n"
+                   "**Recommended:** **2%** as a default. Software / asset-light: **0-2%** (negative deferred-revenue "
+                   "tailwind possible). Manufacturing / industrial: **3-7%**. Retail / inventory-heavy: **5-10%**.")
 
     st.markdown("---")
 
@@ -503,27 +516,41 @@ with st.sidebar:
     if st.session_state.growth_mode == "Constant":
         st.slider("Annual Growth Rate (%)", min_value=-20.0, max_value=100.0, step=0.5, key="growth",
                   format="%.1f%%",
-                  help="Revenue growth during the forecast period. EDGAR fills with 3-yr CAGR. "
-                       "If >50% sustained, prefer 3-stage growth — perpetual high growth is rarely realistic.")
+                  help="Revenue growth during the forecast period. EDGAR fills with 3-yr CAGR.\n\n"
+                       "**Recommended:** mature large-caps: **3-7%**. Above-GDP growth firms: **8-15%**. "
+                       "High-growth: **15-25%**. Hypergrowth (NVDA, SHOP): **25%+** but switch to **3-stage** mode — "
+                       "perpetual high growth is rarely realistic.")
     else:
         st.slider("High-growth Rate (%)", min_value=-10.0, max_value=80.0, step=0.5,
                   key="high_growth", format="%.1f%%",
-                  help="Growth rate during the high-growth phase. Often 10-25% for growth companies.")
+                  help="Growth rate during the high-growth phase.\n\n"
+                       "**Recommended:** strong large-caps: **10-15%**. Growth companies: **15-25%**. "
+                       "Hypergrowth (early-stage tech, semis): **25-50%**. Match this to recent reported revenue growth.")
         st.slider("High-growth Years", min_value=1, max_value=10,
                   key="high_years",
-                  help="Number of years at the high-growth rate before fading begins.")
+                  help="Number of years at the high-growth rate before fading begins.\n\n"
+                       "**Recommended:** **3 years** for most growth firms. **5 years** for companies with strong "
+                       "competitive moats or large addressable markets. Beyond 5-7 years, fade is more honest.")
         st.slider("Fade-down Years", min_value=1, max_value=10,
                   key="fade_years",
-                  help="Number of years over which growth linearly fades from high-growth rate to terminal rate.")
+                  help="Number of years over which growth linearly fades from high-growth rate to terminal rate.\n\n"
+                       "**Recommended:** **4-7 years**. Longer fades imply slower competitive erosion — appropriate "
+                       "for moat-protected firms. Shorter fades (2-3 yrs) for commodity-like or cyclical businesses.")
         # In 3-stage mode, the simple `growth` slider is unused — show it disabled for transparency
         st.caption("(The simple 'Annual Growth Rate' slider is ignored in 3-stage mode.)")
 
     st.slider("Terminal Growth Rate (%)", min_value=0.0, max_value=10.0, step=0.25,
               key="terminal_growth", format="%.2f%%",
-              help="Perpetual growth after the forecast period. Cap at long-run GDP growth (~2-3%).")
+              help="Perpetual growth after the forecast period.\n\n"
+                   "**Recommended:** **2.5%** as a default (long-run US real GDP growth + inflation target). "
+                   "Hard ceiling: **3%**. Going above implies the company eventually grows faster than the whole economy — "
+                   "mathematically impossible long-term. Below 2% for declining industries.")
 
     st.slider("Forecast Years", min_value=3, max_value=15, key="years",
-              help="Length of the explicit forecast. Standard is 5-10 years.")
+              help="Length of the explicit forecast.\n\n"
+                   "**Recommended:** **5 years** for stable mature firms. **7-10 years** for growth firms where "
+                   "near-term cash flows differ materially from steady-state. Banks/research notes typically use 5; "
+                   "academic / textbook DCFs typically use 10.")
 
     # ── Terminal Value method ──
     st.radio("Terminal Value method", options=["Gordon Growth", "Exit Multiple"],
@@ -532,7 +559,10 @@ with st.sidebar:
     if st.session_state.tv_method == "Exit Multiple":
         st.slider("Exit EV/EBITDA Multiple", min_value=2.0, max_value=40.0, step=0.5,
                   key="exit_multiple", format="%.1fx",
-                  help="EV / EBITDA multiple at exit. Mature: 8-12x. Growth: 15-25x. Premium tech: 25x+.")
+                  help="EV / EBITDA multiple at exit.\n\n"
+                       "**Recommended:** S&P 500 long-run average: **~12x**. Mature large-caps: **8-12x**. "
+                       "Growth companies: **15-25x**. Premium software / SaaS: **25-35x**. "
+                       "Capital-intensive / cyclical (auto, airlines): **5-8x**.")
 
     st.markdown("---")
 
@@ -553,22 +583,42 @@ with st.sidebar:
     if st.session_state.wacc_mode == "Direct":
         st.slider("WACC (%)", min_value=1.0, max_value=30.0, step=0.25, key="wacc",
                   format="%.2f%%",
-                  help="Weighted Average Cost of Capital. Mature firms: 7-10%. Riskier: 10-15%.")
+                  help="Weighted Average Cost of Capital.\n\n"
+                       "**Recommended:** **8-9%** for blue-chip large-caps (AAPL, MSFT, JNJ). "
+                       "**9-11%** for mid-cap / cyclical (industrials, consumer discretionary). "
+                       "**11-14%** for growth tech, smaller / international. **14%+** for biotech, micro-cap, "
+                       "high-leverage, or emerging-market firms. If unsure, use **CAPM build-up** mode below.")
     else:
         st.slider("Risk-free Rate Rf (%)", min_value=0.0, max_value=10.0, step=0.05,
                   key="rf", format="%.2f%%",
-                  help="10-year US Treasury yield. As of 2025, ~4.0-4.5%.")
+                  help="10-year US Treasury yield.\n\n"
+                       "**Recommended:** **~4.2%** (current 10-yr UST as of 2026). Use the actual current yield "
+                       "from cnbc.com/quotes/US10Y or finance.yahoo.com (^TNX). For non-US firms, use the local "
+                       "10-year sovereign yield + a country-risk premium.")
         st.slider("Equity Risk Premium ERP (%)", min_value=2.0, max_value=12.0, step=0.1,
                   key="erp", format="%.2f%%",
-                  help="Excess return required over the risk-free rate for holding stocks. US historical ~5-6%.")
+                  help="Excess return required over the risk-free rate for holding stocks.\n\n"
+                       "**Recommended:** **5.5%** as a default (Damodaran current implied ERP for the S&P 500). "
+                       "Historical realised: **~6%** (1928-2024). Forward-looking estimates from Wall Street: "
+                       "**4.5-6.5%**. For emerging markets, add a country-risk premium of 1-5%.")
         st.slider("Beta (β)", min_value=0.0, max_value=3.0, step=0.05, key="beta",
-                  help="Stock's sensitivity to market moves. 1.0 = market average. Tech > 1, utilities < 1.")
+                  help="Stock's sensitivity to market moves. 1.0 = market average.\n\n"
+                       "**Recommended:** look up on finance.yahoo.com (Statistics tab) or stockanalysis.com. "
+                       "Defensive / staples / utilities: **0.5-0.9**. Broad market average: **1.0**. "
+                       "Tech / cyclicals: **1.1-1.5**. High-beta names (NVDA, TSLA, semis, biotech): **1.5-2.5**.")
         st.slider("Pre-tax Cost of Debt Rd (%)", min_value=0.0, max_value=15.0, step=0.1,
                   key="rd_pretax", format="%.2f%%",
-                  help="Yield on the company's debt. Investment-grade typically 4-6%, high-yield 6-10%.")
+                  help="Yield on the company's debt (pre-tax).\n\n"
+                       "**Recommended:** AAA / large-cap blue chip: **4-5%**. Investment-grade (BBB to AA): **5-6.5%**. "
+                       "BB / weaker IG: **6.5-8%**. High-yield (B and below): **8-12%**. "
+                       "Approximate as Risk-free + credit spread (look up on FRED's BAML indices).")
         st.slider("Target Debt Weight (D/V) (%)", min_value=0.0, max_value=80.0, step=1.0,
                   key="weight_debt", format="%.0f%%",
-                  help="Debt as % of total capital. Equity weight = 100% − Debt weight.")
+                  help="Debt as % of total capital. Equity weight = 100% − Debt weight.\n\n"
+                       "**Recommended:** tech / asset-light: **5-15%**. Healthcare / consumer staples: **20-30%**. "
+                       "Industrials / energy: **30-40%**. Utilities / REITs / banks: **40-60%**. "
+                       "Use **market-value** weights (book values are often misleading). "
+                       "Approximate: market cap ÷ (market cap + total debt).")
 
     st.markdown("---")
 
@@ -580,7 +630,9 @@ with st.sidebar:
         st.slider("Verdict threshold — 'Fairly Valued' band (±%)", min_value=2.0, max_value=25.0,
                   step=1.0, key="fair_band", format="%.0f%%",
                   help="If intrinsic value is within ±this band of market price, verdict says 'Fairly Valued'. "
-                       "Outside the band: 'Undervalued' or 'Overvalued'.")
+                       "Outside the band: 'Undervalued' or 'Overvalued'.\n\n"
+                       "**Recommended:** **10%** as a balanced default. Tighter (5%) is too strict given DCF "
+                       "input uncertainty. Wider (20%+) makes most stocks look 'fairly valued' and weakens the signal.")
 
     # Capital Structure (Total Debt, Cash & Equivalents, Shares Outstanding)
     # and Market Reference (Current Stock Price) widgets intentionally hidden.
