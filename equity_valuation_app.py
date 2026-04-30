@@ -275,9 +275,14 @@ DEFAULTS = {
     "wacc":            8.5,        # % — large-cap blue chip
     "terminal_growth": 2.5,        # %
     "years":           5,
-    # debt / cash / shares / current_price intentionally NOT defaulted —
-    # the customer fills them in themselves using the historical norms shown
-    # in each field's tooltip as guidance.
+    # debt / cash / shares / current_price drive the math but are not shown
+    # as visible widgets in the sidebar — the customer sees the valuation
+    # output, not the raw inputs. Defaults are AAPL-shaped fallbacks; EDGAR
+    # autofill overwrites debt/cash/shares when a ticker is loaded.
+    "debt":            107000.0,   # $M
+    "cash":            65000.0,    # $M
+    "shares":          15300.0,    # millions
+    "current_price":   210.00,     # $
     "edgar_data":      None,
     "loaded_ticker":   "AAPL",
     "edgar_msg":       None,
@@ -374,11 +379,12 @@ def apply_edgar_autofill():
         st.session_state.company_name = edgar["name"]
     _set("revenue", edgar.get("revenue"))
     _set("margin",  edgar.get("ebit_margin"))
+    _set("shares",  edgar.get("shares"))
     _set("growth",  edgar.get("revenue_cagr"))
-    # Note: shares / cash / debt are intentionally NOT auto-populated.
-    # The customer enters them themselves using the historical norms shown
-    # in each input's tooltip ("?" icon). EDGAR data is preserved in
-    # session_state.edgar_data for the tooltip to render from.
+    if edgar.get("cash") is not None and edgar.get("cash") >= 0:
+        st.session_state.cash = round(edgar["cash"], 0)
+    if edgar.get("debt") is not None and edgar.get("debt") >= 0:
+        st.session_state.debt = round(edgar["debt"], 0)
     if edgar.get("capex") and edgar.get("revenue") and edgar.get("ebit_margin"):
         nopat = edgar["revenue"] * (edgar["ebit_margin"]/100) * (1 - st.session_state.tax_rate/100)
         if nopat > 0:
@@ -595,53 +601,11 @@ with st.sidebar:
                   help="If intrinsic value is within ±this band of market price, verdict says 'Fairly Valued'. "
                        "Outside the band: 'Undervalued' or 'Overvalued'.")
 
-    st.markdown("---")
-
-    # ─── Capital structure ───────────────────────────────────────────────────
-    # Tooltips show historical norms from EDGAR for the loaded ticker so the
-    # customer has a reference point without us pre-filling the field.
-    def _historical_help(field_label: str, history: list, units: str, base_help: str) -> str:
-        """Build help text combining base guidance with historical EDGAR data.
-        history is a list of (year, value) tuples sorted newest-first."""
-        if not history:
-            return base_help
-        lo = min(v for _, v in history)
-        hi = max(v for _, v in history)
-        avg = sum(v for _, v in history) / len(history)
-        latest_y, latest_v = history[0]
-        co = (st.session_state.get("edgar_data") or {}).get("name", "this company")
-        per_year = " · ".join(f"FY{y}: {v:,.0f}" for y, v in history)
-        return (
-            f"{base_help}\n\n"
-            f"**{co} historical {field_label.lower()}** ({units}):\n"
-            f"- Latest (FY{latest_y}): **{latest_v:,.0f}**\n"
-            f"- {len(history)}-yr range: {lo:,.0f} – {hi:,.0f}  ·  avg {avg:,.0f}\n"
-            f"- Per year: {per_year}"
-        )
-
-    edata = st.session_state.get("edgar_data") or {}
-    st.subheader("⚖️ Capital Structure")
-    st.number_input("Total Debt ($M)", min_value=0.0, step=100.0, key="debt", value=None,
-                    placeholder="Enter total debt in $M",
-                    help=_historical_help("Total Debt", edata.get("debt_history", []), "$M",
-                        "Long-term + short-term debt from balance sheet."))
-    st.number_input("Cash & Equivalents ($M)", min_value=0.0, step=100.0, key="cash", value=None,
-                    placeholder="Enter cash in $M",
-                    help=_historical_help("Cash & Equivalents", edata.get("cash_history", []), "$M",
-                        "Cash + marketable securities. Subtracted from EV → equity value."))
-    st.number_input("Shares Outstanding (millions)", min_value=0.1, step=10.0, key="shares", value=None,
-                    placeholder="Enter share count in millions",
-                    help=_historical_help("Shares Outstanding", edata.get("shares_history", []), "M",
-                        "Diluted share count for per-share value."))
-
-    st.markdown("---")
-
-    # ─── Market reference ────────────────────────────────────────────────────
-    st.subheader("📊 Market Reference")
-    st.number_input("Current Stock Price ($)", min_value=0.01, step=0.50, key="current_price", value=None,
-                    placeholder="Enter today's price",
-                    help="Today's market price. Look it up on Google Finance and paste here. "
-                         "EDGAR doesn't carry real-time prices, so this one's on you.")
+    # Capital structure (Total Debt, Cash, Shares Outstanding) and current
+    # stock price are intentionally NOT shown as visible widgets. They drive
+    # the math from session_state — debt/cash/shares are populated by EDGAR
+    # autofill on ticker change; current_price keeps its DEFAULTS fallback.
+    # The customer sees the valuation output, not the raw inputs.
 
 
 # =============================================================================
@@ -810,17 +774,7 @@ if st.session_state.wacc_mode == "CAPM build-up":
         tax_rate,
     )
 
-# Validation splits into two buckets so first-time visitors don't see a red
-# alarm just because they haven't filled in the sidebar yet:
-#   - missing_inputs: blank-but-required fields (shares, price). Friendly prompt.
-#   - input_errors: actual conflicts that would break the math. Red error.
-# WACC has been resolved either way at this point.
-missing_inputs = []
-if st.session_state.get("shares") in (None, 0, 0.0):
-    missing_inputs.append("**Shares Outstanding** — hover the **?** for historical norms.")
-if st.session_state.get("current_price") in (None, 0, 0.0):
-    missing_inputs.append("**Current Stock Price** — look it up on Google Finance.")
-
+# Now validate (WACC has been resolved either way)
 input_errors = []
 if revenue <= 0:
     input_errors.append("Revenue must be > 0.")
@@ -831,22 +785,11 @@ if wacc <= term_g:
         f"WACC ({wacc*100:.2f}%) must be greater than Terminal Growth ({term_g*100:.2f}%) — "
         "otherwise the Gordon Growth formula explodes to infinity."
     )
-if shares < 0 or (st.session_state.get("shares") not in (None,) and shares <= 0):
-    # Field has a value but it's non-positive — that's a real conflict.
-    if "Shares Outstanding" not in " ".join(missing_inputs):
-        input_errors.append("Shares Outstanding must be > 0.")
-
+if shares <= 0:
+    input_errors.append("Shares Outstanding must be > 0.")
 if input_errors:
     st.error("⚠️ **Cannot run DCF — please fix these inputs first:**\n\n" +
              "\n".join(f"- {e}" for e in input_errors))
-    st.stop()
-if missing_inputs:
-    st.info(
-        "👋 **Almost ready.** Fill in the remaining sidebar inputs to run the valuation:\n\n"
-        + "\n".join(f"- {m}" for m in missing_inputs)
-        + "\n\nEverything else (revenue, margins, growth, WACC) is already populated"
-          " — load a ticker in the sidebar to refresh those from EDGAR."
-    )
     st.stop()
 
 dcf = run_dcf(
