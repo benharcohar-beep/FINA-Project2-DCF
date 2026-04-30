@@ -810,17 +810,7 @@ if st.session_state.wacc_mode == "CAPM build-up":
         tax_rate,
     )
 
-# Validation splits into two buckets so first-time visitors don't see a red
-# alarm just because they haven't filled in the sidebar yet:
-#   - missing_inputs: blank-but-required fields (shares, price). Friendly prompt.
-#   - input_errors: actual conflicts that would break the math. Red error.
-# WACC has been resolved either way at this point.
-missing_inputs = []
-if st.session_state.get("shares") in (None, 0, 0.0):
-    missing_inputs.append("**Shares Outstanding** — hover the **?** for historical norms.")
-if st.session_state.get("current_price") in (None, 0, 0.0):
-    missing_inputs.append("**Current Stock Price** — look it up on Google Finance.")
-
+# Now validate (WACC has been resolved either way)
 input_errors = []
 if revenue <= 0:
     input_errors.append("Revenue must be > 0.")
@@ -831,22 +821,15 @@ if wacc <= term_g:
         f"WACC ({wacc*100:.2f}%) must be greater than Terminal Growth ({term_g*100:.2f}%) — "
         "otherwise the Gordon Growth formula explodes to infinity."
     )
-if shares < 0 or (st.session_state.get("shares") not in (None,) and shares <= 0):
-    # Field has a value but it's non-positive — that's a real conflict.
-    if "Shares Outstanding" not in " ".join(missing_inputs):
-        input_errors.append("Shares Outstanding must be > 0.")
-
+if st.session_state.get("shares") in (None, 0, 0.0):
+    input_errors.append("Shares Outstanding is empty — fill it in (the tooltip shows historical norms).")
+elif shares <= 0:
+    input_errors.append("Shares Outstanding must be > 0.")
+if st.session_state.get("current_price") in (None, 0, 0.0):
+    input_errors.append("Current Stock Price is empty — fill it in (look it up on Google Finance).")
 if input_errors:
     st.error("⚠️ **Cannot run DCF — please fix these inputs first:**\n\n" +
              "\n".join(f"- {e}" for e in input_errors))
-    st.stop()
-if missing_inputs:
-    st.info(
-        "👋 **Almost ready.** Fill in the remaining sidebar inputs to run the valuation:\n\n"
-        + "\n".join(f"- {m}" for m in missing_inputs)
-        + "\n\nEverything else (revenue, margins, growth, WACC) is already populated"
-          " — load a ticker in the sidebar to refresh those from EDGAR."
-    )
     st.stop()
 
 dcf = run_dcf(
